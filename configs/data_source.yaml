@@ -1,0 +1,28 @@
+# Points at the dataset's canonical S3 location. This file is version
+# control for the *dataset*, since the data itself is gitignored: it's the
+# committed pointer to what's authoritative, while data/raw/ is just a local
+# working copy pulled from here.
+#
+# Fill in version_id for each path after upload, once bucket versioning is
+# on (`aws s3api put-bucket-versioning --bucket ml-challenge-qbyte
+# --versioning-configuration Status=Enabled`) and the upload has finished:
+#
+#   aws s3api list-object-versions \
+#     --bucket ml-challenge-qbyte \
+#     --prefix entity-resolution/raw/extracted/student_resource/
+#
+# Bump version_id here any time the bucket contents are re-uploaded, so the
+# manifest never silently drifts from what's actually in S3.
+
+bucket: ml-challenge-qbyte
+prefix: entity-resolution/raw/extracted/student_resource
+
+paths:
+  train:
+    s3: dataset/train/
+    local: data/raw/train/
+    version_id: null # fill in after upload
+  test:
+    s3: dataset/test/
+    local: data/raw/test/
+    version_id: null # fill in after upload
