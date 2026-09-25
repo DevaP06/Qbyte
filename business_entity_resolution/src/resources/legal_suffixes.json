@@ -1,0 +1,35 @@
+{
+  "_comment": "Static, hand-authored domain knowledge only — no external lookup, no country-specific entries. Used identically for every country string.",
+
+  "legal_suffix_canonical_map": {
+    "pvt": "pvt",
+    "private": "pvt",
+    "ltd": "ltd",
+    "limited": "ltd",
+    "corp": "corp",
+    "corporation": "corp",
+    "inc": "inc",
+    "incorporated": "inc",
+    "llc": "llc",
+    "llp": "llp"
+  },
+
+  "generic_blocking_stopwords": [
+    "limited",
+    "llc",
+    "private",
+    "inc",
+    "ltd",
+    "com",
+    "center",
+    "pvt",
+    "services",
+    "corp",
+    "group",
+    "india",
+    "holdings",
+    "care",
+    "associates",
+    "llp"
+  ]
+}
