@@ -1,0 +1,2 @@
+sagemaker>=2.232,<3
+boto3

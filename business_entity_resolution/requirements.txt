@@ -2,3 +2,9 @@ mlflow
 pyyaml
 pandas==2.2.3
 pyarrow==19.0.1
+numpy==2.5.3
+scipy==1.18.1
+scikit-learn==1.9.1
+rapidfuzz==3.14.6
+lightgbm==4.7.0
+xgboost==3.4.1

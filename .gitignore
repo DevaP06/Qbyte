@@ -39,6 +39,8 @@ aws.json
 *.pth
 *.h5
 *.onnx
+# LightGBM model.txt / metrics.json from train_classifier.py (regenerable)
+data/processed/models/
 
 # MLflow
 mlruns/

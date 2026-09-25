@@ -1,8 +1,7 @@
-"""Paths, column names, and shared constants for the cleaning stage.
+"""Paths, column names, and shared constants for every implemented stage.
 
-No hyperparameters for later stages (blocking/embedding/model) live here yet
-- only what normalize.py/address_parser.py/io_utils.py need. Extend this file
-as later stages are implemented rather than pre-declaring their settings now.
+Currently: cleaning, token blocking, pairwise features. Extend this file as
+later stages are implemented rather than pre-declaring their settings now.
 """
 
 from pathlib import Path
@@ -133,3 +132,85 @@ BLOCKING_QUERY_BATCH_SIZE = 1_000
 BLOCKING_NUM_THREADS = 4
 
 CANDIDATES_DIR = DATA_PROCESSED_DIR / "candidates"
+
+# --- Pairwise features (plan.md build-order step 3) ------------------------
+
+FEATURES_DIR = DATA_PROCESSED_DIR / "features"
+
+# Candidate pairs per feature chunk. Chunks are cut on S1-entity boundaries
+# (never mid-entity, so per-S1 context features see the entity's whole
+# candidate list), so actual chunk sizes run slightly over this. At ~40
+# candidates/entity, 1M pairs keeps every gathered sparse slice and string
+# list in a chunk to a few hundred MB.
+FEATURE_CHUNK_PAIRS = 1_000_000
+
+# Hashed feature space for name character trigrams. Stateless hashing (no
+# fitted vocabulary) so train and test -- including France's unseen
+# vocabulary -- go through the identical code path; 2^21 buckets keeps
+# collisions rare for the few hundred thousand distinct trigrams across
+# Latin + Devanagari/Kannada names.
+FEATURE_CHAR_NGRAM_HASH_SIZE = 2**21
+
+# --- Classifier (plan.md build-order step 4) --------------------------------
+
+MODELS_DIR = DATA_PROCESSED_DIR / "models"
+
+# Entity-level split (never within an S1 entity), stratified by country:
+# dev_val is held out for threshold tuning + reported F_0.5; the early-stopping
+# set is carved from what remains, so dev_val never influences training.
+DEV_VAL_FRACTION = 0.15
+EARLY_STOPPING_FRACTION = 0.05
+SPLIT_SEED = 42
+
+# Stock binary objective, no positive re-weighting: the train positive rate
+# among candidates (~8%) is not extreme for a GBDT, and F_0.5 favours
+# precision -- up-weighting positives pushes the other way. The macro-F_0.5
+# threshold search absorbs the class prior instead. bagging_fraction 0.5
+# halves per-iteration cost on ~75M training rows.
+LGBM_PARAMS = {
+    "objective": "binary",
+    "metric": "binary_logloss",
+    "learning_rate": 0.1,
+    "num_leaves": 127,
+    "min_data_in_leaf": 500,
+    "feature_fraction": 0.8,
+    "bagging_fraction": 0.5,
+    "bagging_freq": 1,
+    "lambda_l2": 1.0,
+    "max_bin": 255,
+    "seed": SPLIT_SEED,
+    "verbose": -1,
+}
+
+# XGBoost equivalent, for GPU training (train_classifier.py --gpu). Leaf-wise
+# growth (lossguide + max_leaves) mirrors LightGBM's tree shape; the rest
+# mirrors the LightGBM settings above one-for-one where a counterpart exists.
+# min_child_weight is a hessian sum, not a row count: at ~8% positives a leaf
+# of 500 rows has a hessian of roughly 500 * p(1-p) ~ 20-40, so 20 is the
+# closest analogue of min_data_in_leaf=500.
+XGB_PARAMS = {
+    "objective": "binary:logistic",
+    "eval_metric": "logloss",
+    "tree_method": "hist",
+    "learning_rate": 0.1,
+    "grow_policy": "lossguide",
+    "max_depth": 0,
+    "max_leaves": 127,
+    "min_child_weight": 20,
+    "colsample_bytree": 0.8,
+    "subsample": 0.5,
+    "reg_lambda": 1.0,
+    "max_bin": 256,
+    "seed": SPLIT_SEED,
+}
+
+# The first full-data GPU dev run (70.6M fit pairs) was still improving at
+# 2000 rounds -- it hit the cap without early stopping -- so the cap sits
+# well above that; early stopping is what actually ends training.
+MAX_ROUNDS = 5000
+EARLY_STOPPING_ROUNDS = 50
+
+# --- Prediction + submission (plan.md steps 5 + 9) ---------------------------
+
+PREDICTIONS_DIR = DATA_PROCESSED_DIR / "predictions"
+OUTPUT_DIR = REPO_ROOT / "output"
