@@ -1,2 +1,4 @@
 mlflow
 pyyaml
+pandas==2.2.3
+pyarrow==19.0.1
