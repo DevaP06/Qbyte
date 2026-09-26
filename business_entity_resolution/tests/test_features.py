@@ -20,6 +20,8 @@ from features import (  # noqa: E402
     FEATURE_COLUMNS,
     build_feature_corpus,
     feature_columns_of,
+    name_initials_and_compact,
+    street_core,
     chunk_bounds,
     group_starts,
     iter_feature_chunks,
@@ -191,6 +193,29 @@ def test_embedding_features_from_union_candidates():
     assert us.loc["S3-1", "emb_cos_gap"] == 0.0 and us.loc["S3-1", "emb_cos_rank"] == 0.0
     assert math.isclose(us.loc["S3-2", "emb_cos_gap"], 0.62, abs_tol=1e-6)
     assert us.loc["S3-2", "block_rank"] == 2.0  # embedding-only pairs rank after every token pair
+
+
+def test_street_core():
+    assert street_core("12 rue des travailleurs, lille, hauts-de-france") == "travailleurs"
+    assert street_core("12 r. de crimee, lille") == "crimee"
+    assert street_core("il, chicago, 1840 blue island avenue") == "blue island"  # reordered address
+    assert street_core("616 81st street, chicago, il") == "81st"  # ordinals kept, house numbers dropped
+    assert street_core("9628c spyglass drive, oregon") == "spyglass"
+    assert street_core("plot no. 20, jaipur") == ""  # nothing identifying left
+    assert street_core("") == ""
+
+
+def test_name_acronyms():
+    assert name_initials_and_compact(["art", "forces", "comite", "eurl"]) == ("afc", "artforcescomite")
+    assert name_initials_and_compact(["afc"]) == ("a", "afc")
+    assert name_initials_and_compact(["pvt", "ltd"]) == ("", "")
+
+
+def test_street_core_ratio_and_acronym_in_features():
+    f = _features()
+    same = f.loc[("S1-3", "S2-4")]  # identical French record
+    assert same["street_core_ratio"] == 1.0 and same["name_acronym_match"] == 0.0
+    assert np.isnan(f.loc[("S1-2", "S2-3"), "street_core_ratio"])  # candidate has no address
 
 
 def test_feature_columns_of_reads_the_schema():

@@ -41,6 +41,7 @@ Deviations from plan.md's Task 2 text:
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import time
 from dataclasses import dataclass
@@ -60,6 +61,7 @@ import config
 from blocking_token import _flatten_token_list_column, _tokenize_address_column, build_token_index
 from clean_all import ProgressBar
 from io_utils import read_cleaned_table
+from normalize import GENERIC_BLOCKING_STOPWORDS, _tokenize
 
 ID_COLUMNS = ["source1_entity_id", "candidate_entity_id"]
 
@@ -103,6 +105,10 @@ FEATURE_COLUMNS = [
     "addr_digit_jaccard",
     "addr_both_present",
     "addr_len_ratio",
+    # street name only (house number / street type / fillers removed), and
+    # name acronyms ("afc" <-> "art forces comite") -- cycle 1
+    "street_core_ratio",
+    "name_acronym_match",
     # metadata
     "cand_is_source3",
     # blocking
@@ -128,6 +134,20 @@ EMBEDDING_FEATURE_COLUMNS = [
     "from_token",  # 1 if token blocking retrieved the pair (score > 0)
 ]
 
+# Added by competition_features.py (a pass over a whole features dataset): how
+# this S1 ranks among ALL S1 entities that share the candidate. A name-only
+# record is a candidate of ~37 S1s; whether it belongs to this one depends on
+# the rivals, which no pair-local feature can see.
+COMPETITION_FEATURE_COLUMNS = [
+    "comp_n_s1",  # number of S1 entities that have this candidate
+    "comp_char3_rank",  # this S1's rank among them by name_char3_idf_cos (0 = best)
+    "comp_char3_margin",  # value minus best rival (>0: this S1 wins; NaN: no rival)
+    "comp_name_tsr_rank",  # ... by name_token_set_ratio
+    "comp_name_tsr_margin",
+    "comp_emb_rank",  # ... by emb_cos (union datasets only)
+    "comp_emb_margin",
+]
+
 
 def feature_columns_of(features_dir) -> list:
     """The model feature columns of a features dataset, from its schema, in
@@ -139,7 +159,7 @@ def feature_columns_of(features_dir) -> list:
     if first is None:
         raise FileNotFoundError(f"no feature parts in {features_dir} -- run features.py first")
     present = set(pq.read_schema(first).names)
-    return [c for c in FEATURE_COLUMNS + EMBEDDING_FEATURE_COLUMNS if c in present]
+    return [c for c in FEATURE_COLUMNS + EMBEDDING_FEATURE_COLUMNS + COMPETITION_FEATURE_COLUMNS if c in present]
 
 
 # --------------------------------------------------------------------------
@@ -249,6 +269,49 @@ def _char_trigram_matrix(texts: pa.Array, batch_rows: int = 500_000) -> sp.csr_m
 
 
 # --------------------------------------------------------------------------
+# Street core + acronyms (per record, computed once per split)
+# --------------------------------------------------------------------------
+
+# Hand-written, one list for every country (no country branch). Street *types*
+# pick which comma component is the street (addresses are often reordered:
+# "il, chicago, 1840 blue island avenue"); types, fillers and articles are then
+# dropped so only the street's identifying words remain:
+# "12 rue des travailleurs" -> "travailleurs", "12 r. de crimee" -> "crimee".
+_STREET_TYPES = frozenset(
+    "street st str road rd avenue ave av boulevard blvd bd drive dr lane ln court ct place pl terrace ter "
+    "circle cir way highway hwy parkway pkwy square sq trail trl rue r route rte rt chemin ch chem impasse "
+    "imp allee all quai cours marg main cross path".split()
+)
+_STREET_FILLERS = frozenset(
+    "no nos door plot flat shop house h hno unit suite ste apt floor fl bldg block blk po box null "
+    "de des du la le les d l of the".split()
+)
+_HOUSE_NUMBER_RE = re.compile(r"^\d+[a-z]?$")  # 1840, 9628c -- but not ordinals like 12th / 81st
+
+
+def street_core(address: str) -> str:
+    components = [_tokenize(c) for c in address.split(",")]
+    street = next((t for t in components if _STREET_TYPES.intersection(t)), None)
+    if street is None:
+        street = next((t for t in components if any(ch.isdigit() for tok in t for ch in tok)), ())
+    return " ".join(
+        w for w in street
+        if len(w) > 1 and w not in _STREET_TYPES and w not in _STREET_FILLERS and not _HOUSE_NUMBER_RE.match(w)
+    )
+
+
+# Legal forms skipped when building acronyms: the shared legal/generic list
+# plus French forms it lacks (France is only in test).
+_ACRONYM_SKIP = GENERIC_BLOCKING_STOPWORDS | frozenset("sarl sas sasu eurl sa sci ei snc".split())
+
+
+def name_initials_and_compact(tokens) -> tuple[str, str]:
+    """("afc", "artforcescomite") for ["art", "forces", "comite", "eurl"]."""
+    content = [t for t in tokens if t not in _ACRONYM_SKIP]
+    return "".join(t[0] for t in content), "".join(content)
+
+
+# --------------------------------------------------------------------------
 # Per-split corpus: every S1/S2/S3 row, one shared row space
 # --------------------------------------------------------------------------
 
@@ -274,6 +337,10 @@ class FeatureCorpus:
     addr_middle_len: np.ndarray
     addr_tail: pa.Array
     addr_len: np.ndarray
+    street_core: pa.Array
+    street_core_len: np.ndarray
+    name_initials: pa.Array
+    name_compact: pa.Array
     name_words: TokenSpace
     name_char3: TokenSpace
     addr_words: TokenSpace
@@ -325,10 +392,24 @@ def build_feature_corpus(split: str) -> FeatureCorpus:
     addr_text = _filled(table, "address_normalized")
     addr_middle = pc.fill_null(pc.binary_join(table.column("address_middle").combine_chunks(), " "), "")
 
+    print(f"  [corpus 1/4] name + address token indices ({n_rows:,} records) ...", flush=True)
     name_flat, name_rows = _flatten_token_list_column(table.column("name_tokens").combine_chunks())
     name_index = build_token_index(name_flat, name_rows, n_rows)  # generic tokens kept -- IDF down-weights them
     addr_flat, addr_rows = _tokenize_address_column(addr_text.to_numpy(zero_copy_only=False))
     addr_index = build_token_index(addr_flat, addr_rows, n_rows)
+
+    print("  [corpus 2/4] street cores + name acronyms ...", flush=True)
+    street = pa.array([street_core(a) for a in addr_text.to_numpy(zero_copy_only=False)], type=pa.string())
+    initials, compact = [], []
+    tokens_col = table.column("name_tokens").combine_chunks()
+    for s in range(0, n_rows, 1_000_000):  # bounded Python-object memory
+        for toks in tokens_col.slice(s, 1_000_000).to_pylist():
+            i, c = name_initials_and_compact(toks or ())
+            initials.append(i)
+            compact.append(c)
+    print("  [corpus 3/4] name character trigrams + per-country IDF (slowest step) ...", flush=True)
+    name_char3 = build_token_space(_char_trigram_matrix(name_text), country_codes, n_countries)
+    print("  [corpus 4/4] word IDF spaces ...", flush=True)
 
     return FeatureCorpus(
         entity_ids=entity_ids,
@@ -346,8 +427,12 @@ def build_feature_corpus(split: str) -> FeatureCorpus:
         addr_middle_len=pc.utf8_length(addr_middle).to_numpy().astype(np.float32),
         addr_tail=_filled(table, "address_tail"),
         addr_len=pc.utf8_length(addr_text).to_numpy().astype(np.float32),
+        street_core=street,
+        street_core_len=pc.utf8_length(street).to_numpy().astype(np.float32),
+        name_initials=pa.array(initials, type=pa.string()),
+        name_compact=pa.array(compact, type=pa.string()),
         name_words=build_token_space(name_index.matrix, country_codes, n_countries),
-        name_char3=build_token_space(_char_trigram_matrix(name_text), country_codes, n_countries),
+        name_char3=name_char3,
         addr_words=build_token_space(addr_index.matrix, country_codes, n_countries),
         name_digits=_digit_columns_only(name_index.matrix, name_index.key_to_col),
         addr_digits=_digit_columns_only(addr_index.matrix, addr_index.key_to_col),
@@ -478,6 +563,16 @@ def compute_pair_features(corpus: FeatureCorpus, q: np.ndarray, t: np.ndarray) -
     f["addr_both_present"] = addr_ok.astype(np.float32)
     alen_q, alen_t = corpus.addr_len[q], corpus.addr_len[t]
     f["addr_len_ratio"] = _safe_div(np.minimum(alen_q, alen_t), np.maximum(alen_q, alen_t))
+
+    street_ok = addr_ok & (corpus.street_core_len[q] > 0) & (corpus.street_core_len[t] > 0)
+    f["street_core_ratio"] = _string_similarity(
+        _take_strings(corpus.street_core, q), _take_strings(corpus.street_core, t), fuzz.token_set_ratio, street_ok
+    )
+    init_q, init_t = _take_strings(corpus.name_initials, q), _take_strings(corpus.name_initials, t)
+    comp_q, comp_t = _take_strings(corpus.name_compact, q), _take_strings(corpus.name_compact, t)
+    long_q = np.fromiter((len(s) >= 2 for s in init_q), dtype=bool, count=len(q))
+    long_t = np.fromiter((len(s) >= 2 for s in init_t), dtype=bool, count=len(q))
+    f["name_acronym_match"] = (((init_q == comp_t) & long_q) | ((comp_q == init_t) & long_t)).astype(np.float32)
 
     f["cand_is_source3"] = corpus.is_source3[t].astype(np.float32)
     return f

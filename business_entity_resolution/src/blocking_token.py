@@ -153,6 +153,7 @@ import pyarrow.parquet as pq
 import scipy.sparse as sp
 
 import config
+from clean_all import ProgressBar
 from io_utils import read_cleaned_table
 from normalize import GENERIC_BLOCKING_STOPWORDS, _tokenize
 
@@ -349,6 +350,7 @@ def block_country_partition(
     k: int = config.BLOCKING_MAX_CANDIDATES_PER_ENTITY,
     batch_size: int = config.BLOCKING_QUERY_BATCH_SIZE,
     num_threads: int = config.BLOCKING_NUM_THREADS,
+    progress_label: str = "blocking",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Score = IDF-weighted overlap on the selected keys (name+address
     already combined into one `side` via `combine_sides`); top-k per query
@@ -376,11 +378,18 @@ def block_country_partition(
         rows, cols, scores = _topk_per_row(scored, k)
         return rows + start, cols, scores
 
+    bar = ProgressBar(n_query, progress_label)
+    results = []
     if num_threads > 1 and len(batches) > 1:
         with ThreadPoolExecutor(num_threads) as pool:
-            results = list(pool.map(score_and_reduce, batches))
+            for (start, end), res in zip(batches, pool.map(score_and_reduce, batches)):
+                results.append(res)
+                bar.update(end - start)
     else:
-        results = [score_and_reduce(b) for b in batches]
+        for b in batches:
+            results.append(score_and_reduce(b))
+            bar.update(b[1] - b[0])
+    bar.close()
 
     if not results:
         return (np.array([], dtype=np.int64), np.array([], dtype=np.int64), np.array([], dtype=np.float32))
@@ -517,7 +526,9 @@ def run_blocking(
         )
         combined_side = combine_sides([name_side, addr_side])
 
-        rows, cols, scores = block_country_partition(combined_side, n_query=len(query_rows), k=max_candidates_per_entity)
+        rows, cols, scores = block_country_partition(
+            combined_side, n_query=len(query_rows), k=max_candidates_per_entity, progress_label=f"block {country}"
+        )
 
         query_entity_ids = corpus.entity_ids[query_rows][rows]
         target_entity_ids = corpus.entity_ids[target_rows][cols]

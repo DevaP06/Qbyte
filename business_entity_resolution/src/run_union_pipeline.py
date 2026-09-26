@@ -1,12 +1,13 @@
 """Run the embedding-union pipeline end to end, with an overall progress bar.
 
-    python run_union_pipeline.py            # --k 20 --run dev_union
-    python run_union_pipeline.py --k 30
+    python run_union_pipeline.py                                  # dev model "dev_union", k=20
+    python run_union_pipeline.py --force-features --run dev_v11   # cycle 1: recompute features
 
 Steps run in order and stop at the first failure. Each step's own progress
 bars show live; this script adds a whole-pipeline bar before every step.
-Steps that cache their output (embeddings, candidate_generation, features)
-skip work already done, so re-running after a failure resumes cheaply.
+Embedding and candidate steps skip work already cached; features are
+recomputed only with --force-features (needed whenever features.py changes);
+the competition pass always re-runs (it replaces its own columns).
 """
 
 from __future__ import annotations
@@ -20,16 +21,19 @@ from pathlib import Path
 SRC = Path(__file__).resolve().parent
 
 
-def steps(k: int, run: str) -> list:
+def steps(k: int, run: str, force_features: bool) -> list:
     union = f"union_retriever_k{k}"
+    force = ["--force"] if force_features else []
     # (label, script + args, rough minutes on a 32-thread / RTX 2000 Ada box -- only for the ETA)
     return [
-        ("embed test + kNN", ["embeddings.py", "--split", "test", "--k", "50"], 10),
-        ("union candidates: train (embeds train first)", ["candidate_generation.py", "--split", "train", "--emb-k", str(k)], 45),
-        ("union candidates: test", ["candidate_generation.py", "--split", "test", "--emb-k", str(k)], 10),
-        ("features: train", ["features.py", "--split", "train", "--candidates", union], 20),
-        ("features: test", ["features.py", "--split", "test", "--candidates", union], 15),
-        ("train dev model (GPU)", ["train_classifier.py", "--features", f"train_{union}", "--run", run, "--gpu"], 45),
+        ("embed test + kNN (cached after first run)", ["embeddings.py", "--split", "test", "--k", "50"], 2),
+        ("union candidates: train (cached)", ["candidate_generation.py", "--split", "train", "--emb-k", str(k)], 2),
+        ("union candidates: test (cached)", ["candidate_generation.py", "--split", "test", "--emb-k", str(k)], 2),
+        ("features: train", ["features.py", "--split", "train", "--candidates", union, *force], 25),
+        ("features: test", ["features.py", "--split", "test", "--candidates", union, *force], 20),
+        ("competition features: train", ["competition_features.py", "--features", f"train_{union}"], 8),
+        ("competition features: test", ["competition_features.py", "--features", f"test_{union}"], 7),
+        ("train dev model (GPU)", ["train_classifier.py", "--features", f"train_{union}", "--run", run, "--gpu"], 40),
     ]
 
 
@@ -40,12 +44,13 @@ def fmt(seconds: float) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Embed -> union candidates -> features -> dev model, in one go.")
+    parser = argparse.ArgumentParser(description="Embed -> union candidates -> features -> competition -> dev model.")
     parser.add_argument("--k", type=int, default=20, help="Embedding neighbours added per S1 entity.")
     parser.add_argument("--run", default="dev_union", help="Model run name under data/processed/models/.")
+    parser.add_argument("--force-features", action="store_true", help="Recompute features even if cached.")
     args = parser.parse_args()
 
-    plan = steps(args.k, args.run)
+    plan = steps(args.k, args.run, args.force_features)
     total_min = sum(m for *_, m in plan)
     start = time.time()
     done_min = 0
@@ -65,9 +70,10 @@ def main() -> None:
         print(f"\n step {i}/{len(plan)} done in {fmt(time.time() - t0)}", flush=True)
         done_min += minutes
 
+    union = f"union_retriever_k{args.k}"
     print(f"\n{'=' * 100}\n PIPELINE [{'#' * 30}] 100%  all {len(plan)} steps done in {fmt(time.time() - start)}\n"
-          f" next: python train_classifier.py --mode final --gpu --features train_union_retriever_k{args.k} "
-          f"--dev-run {args.run} --run final_union\n{'=' * 100}", flush=True)
+          f" next: python train_classifier.py --mode final --gpu --features train_{union} "
+          f"--dev-run {args.run} --run final_{args.run.removeprefix('dev_')}\n{'=' * 100}", flush=True)
 
 
 if __name__ == "__main__":
