@@ -41,6 +41,8 @@ aws.json
 *.onnx
 # LightGBM model.txt / metrics.json from train_classifier.py (regenerable)
 data/processed/models/
+# Record embeddings from embeddings.py (~9GB per split)
+data/processed/embeddings/
 
 # MLflow
 mlruns/
