@@ -43,7 +43,7 @@ import xgboost as xgb
 
 import config
 from evaluate import macro_f05, macro_f05_by_group
-from features import FEATURE_COLUMNS
+from features import feature_columns_of
 from labels import PairLabeler, entity_truth, ground_truth_pairs, load_ground_truth
 from threshold_tuning import ThresholdResult, tune_threshold
 
@@ -197,7 +197,8 @@ def split_entities(
 
 @dataclass
 class TrainingData:
-    X: np.ndarray  # (n_pairs, n_features) float32, columns = FEATURE_COLUMNS
+    X: np.ndarray  # (n_pairs, n_features) float32, columns = feature_names
+    feature_names: list  # from the features dataset's schema (features.feature_columns_of)
     y: np.ndarray  # (n_pairs,) int8
     entity: np.ndarray  # (n_pairs,) int32 index into `truth`
     candidate_ids: pa.ChunkedArray
@@ -216,7 +217,8 @@ def load_training_data(
     if not parts:
         raise FileNotFoundError(f"no feature parts in {features_dir} -- run features.py first")
     n_total = sum(pq.ParquetFile(p).metadata.num_rows for p in parts)
-    X = np.empty((n_total, len(FEATURE_COLUMNS)), dtype=np.float32)
+    feature_names = feature_columns_of(features_dir)
+    X = np.empty((n_total, len(feature_names)), dtype=np.float32)
     y = np.empty(n_total, dtype=np.int8)
     entity = np.empty(n_total, dtype=np.int32)
     candidate_chunks = []
@@ -225,11 +227,11 @@ def load_training_data(
     bar = Progress(n_total, "loading", "pairs")
     offset = 0
     for part in parts:
-        table = pq.read_table(part, columns=["source1_entity_id", "candidate_entity_id", *FEATURE_COLUMNS])
+        table = pq.read_table(part, columns=["source1_entity_id", "candidate_entity_id", *feature_names])
         n = table.num_rows
         s1_ids = table.column("source1_entity_id").to_numpy()
         cand = table.column("candidate_entity_id").combine_chunks()
-        for j, col in enumerate(FEATURE_COLUMNS):
+        for j, col in enumerate(feature_names):
             X[offset : offset + n, j] = table.column(col).to_numpy()  # nulls -> NaN
         codes = entity_index.get_indexer(s1_ids)
         assert (codes >= 0).all(), f"{part.name}: S1 id not in ground truth"
@@ -241,7 +243,8 @@ def load_training_data(
     bar.close()
     scope = np.bincount(entity, minlength=len(truth)) > 0 if sampled else np.ones(len(truth), dtype=bool)
     return TrainingData(
-        X=X, y=y, entity=entity, candidate_ids=pa.chunked_array(candidate_chunks), truth=truth, scope=scope
+        X=X, feature_names=feature_names, y=y, entity=entity, candidate_ids=pa.chunked_array(candidate_chunks),
+        truth=truth, scope=scope,
     )
 
 
@@ -291,7 +294,7 @@ class LightGBMTrainer:
         # Binned once; every fold trains on a .subset() of it, so no fold
         # copies the raw matrix. free_raw_data=False keeps subsetting possible.
         self.full = lgb.Dataset(
-            data.X, label=data.y, feature_name=FEATURE_COLUMNS, free_raw_data=False,
+            data.X, label=data.y, feature_name=data.feature_names, free_raw_data=False,
             params={"max_bin": config.LGBM_PARAMS["max_bin"], "verbose": -1},
         ).construct()
 
@@ -325,15 +328,16 @@ class _RowBatches(xgb.DataIter):
     matrix never materializes a full fancy-indexed copy (~12GB for the main
     fit set) on the host."""
 
-    def __init__(self, X: np.ndarray, y: np.ndarray, rows: np.ndarray, batch_rows: int = 5_000_000):
+    def __init__(self, X: np.ndarray, y: np.ndarray, rows: np.ndarray, feature_names: list, batch_rows: int = 5_000_000):
         self._X, self._y, self._rows, self._batch_rows, self._pos = X, y, rows, batch_rows, 0
+        self._feature_names = feature_names
         super().__init__()
 
     def next(self, input_data) -> bool:
         if self._pos >= len(self._rows):
             return False
         r = self._rows[self._pos : self._pos + self._batch_rows]
-        input_data(data=self._X[r], label=self._y[r], feature_names=FEATURE_COLUMNS)
+        input_data(data=self._X[r], label=self._y[r], feature_names=self._feature_names)
         self._pos += self._batch_rows
         return True
 
@@ -361,13 +365,14 @@ class XGBoostModel:
         self.booster[: self.n_rounds].save_model(str(out_dir / "model.json"))
 
     def importance(self) -> pd.DataFrame:
+        names = self.booster.feature_names or []
         gain = self.booster.get_score(importance_type="total_gain")
         split = self.booster.get_score(importance_type="weight")
         return pd.DataFrame(
             {
-                "feature": FEATURE_COLUMNS,
-                "gain": [gain.get(f, 0.0) for f in FEATURE_COLUMNS],
-                "split": [split.get(f, 0.0) for f in FEATURE_COLUMNS],
+                "feature": names,
+                "gain": [gain.get(f, 0.0) for f in names],
+                "split": [split.get(f, 0.0) for f in names],
             }
         ).sort_values("gain", ascending=False)
 
@@ -377,12 +382,12 @@ class XGBoostTrainer:
     params = config.XGB_PARAMS
 
     def __init__(self, data: TrainingData, device: str = "cuda"):
-        self.X, self.y = data.X, data.y
+        self.X, self.y, self.feature_names = data.X, data.y, data.feature_names
         self.params = {**config.XGB_PARAMS, "device": device}
 
     def _matrix(self, rows: np.ndarray, ref: Optional[xgb.QuantileDMatrix] = None) -> xgb.QuantileDMatrix:
         return xgb.QuantileDMatrix(
-            _RowBatches(self.X, self.y, rows), max_bin=self.params["max_bin"], ref=ref
+            _RowBatches(self.X, self.y, rows, self.feature_names), max_bin=self.params["max_bin"], ref=ref
         )
 
     def fit(
@@ -515,7 +520,7 @@ def run_dev(data: TrainingData, trainer, out_dir: Path, fit_frac: float, loco: b
         "n_val_entities": int(val_mask.sum()),
         "fit_entity_fraction": fit_frac,
         "params": trainer.params,
-        "features": FEATURE_COLUMNS,
+        "features": data.feature_names,
     }
 
     if loco:
@@ -606,7 +611,7 @@ def run_final(data: TrainingData, trainer, out_dir: Path, dev_dir: Path) -> None
     model.save(out_dir)
     model.importance().to_csv(out_dir / "feature_importance.csv", index=False)
     metrics = {"mode": "final", "backend": trainer.name, "threshold": threshold, "num_rounds": rounds,
-               "dev_run": dev_dir.name, "params": trainer.params, "features": FEATURE_COLUMNS}
+               "dev_run": dev_dir.name, "params": trainer.params, "features": data.feature_names}
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=float))
     print(f"artifacts written to {out_dir}")
 

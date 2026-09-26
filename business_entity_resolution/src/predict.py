@@ -30,35 +30,40 @@ import xgboost as xgb
 
 import config
 from export import export_submission
-from features import FEATURE_COLUMNS
+from features import feature_columns_of
 from io_utils import read_cleaned_table
 from postprocess import select_matches
 from train_classifier import LightGBMModel, Progress, XGBoostModel, _stage
 
 
 def load_model(run_dir: Path):
-    """(model, threshold) from a train_classifier.py run directory."""
+    """(model, threshold, feature list) from a train_classifier.py run directory."""
     metrics = json.loads((run_dir / "metrics.json").read_text())
-    if metrics["features"] != FEATURE_COLUMNS:
-        raise SystemExit(f"{run_dir.name} was trained on a different feature list -- retrain it on current features")
     if metrics.get("backend", "lightgbm") == "xgboost":
         booster = xgb.Booster(model_file=str(run_dir / "model.json"))
         model = XGBoostModel(booster, booster.num_boosted_rounds())
     else:
         model = LightGBMModel(lgb.Booster(model_file=str(run_dir / "model.txt")))
-    return model, float(metrics["threshold"])
+    return model, float(metrics["threshold"]), list(metrics["features"])
 
 
-def score_features(model, features_dir: Path) -> pd.DataFrame:
+def score_features(model, features_dir: Path, feature_names: list) -> pd.DataFrame:
     parts = sorted(features_dir.glob("part-*.parquet"))
     if not parts:
         raise FileNotFoundError(f"no feature parts in {features_dir} -- run features.py first")
+    available = feature_columns_of(features_dir)
+    if available != feature_names:
+        raise SystemExit(
+            f"model features and features/{features_dir.name} differ -- a model trained on token-only features "
+            f"needs token-only test features (and a union model needs union features).\n"
+            f"  model:    {feature_names}\n  dataset:  {available}"
+        )
     total = sum(pq.ParquetFile(p).metadata.num_rows for p in parts)
     bar = Progress(total, "scoring", "pairs")
     out, done = [], 0
     for part in parts:
-        table = pq.read_table(part, columns=["source1_entity_id", "candidate_entity_id", "country", *FEATURE_COLUMNS])
-        X = np.column_stack([table.column(c).to_numpy() for c in FEATURE_COLUMNS]).astype(np.float32)
+        table = pq.read_table(part, columns=["source1_entity_id", "candidate_entity_id", "country", *feature_names])
+        X = np.column_stack([table.column(c).to_numpy() for c in feature_names]).astype(np.float32)
         out.append(
             pa.table(
                 {
@@ -95,7 +100,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Score candidates and write the submission TSVs.")
     parser.add_argument("--run", required=True, help="Model run directory under data/processed/models/.")
     parser.add_argument("--split", default="test", choices=["test"], help="Split whose S1 entities get output rows.")
-    parser.add_argument("--features", default=None, help="Features directory name (default: same as --split).")
+    parser.add_argument("--features", default=None,
+                        help="Features directory name (default: same as --split; e.g. test_union_retriever_k20).")
     parser.add_argument("--out-dir", default=str(config.OUTPUT_DIR))
     parser.add_argument("--force", action="store_true", help="Re-score even if cached predictions exist.")
     args = parser.parse_args()
@@ -103,8 +109,9 @@ def main() -> None:
     t0 = time.time()
 
     _stage(f"loading model {args.run}")
-    model, threshold = load_model(config.MODELS_DIR / args.run)
-    print(f"  {type(model).__name__}, {model.n_rounds} rounds, threshold {threshold:.4f}", flush=True)
+    model, threshold, feature_names = load_model(config.MODELS_DIR / args.run)
+    print(f"  {type(model).__name__}, {model.n_rounds} rounds, threshold {threshold:.4f}, "
+          f"{len(feature_names)} features", flush=True)
 
     cache = config.PREDICTIONS_DIR / args.run / f"{features_name}.parquet"
     # A retrain under the same run name (e.g. dev_gpu re-run) must invalidate
@@ -118,7 +125,7 @@ def main() -> None:
         scored = pd.read_parquet(cache)
     else:
         _stage(f"scoring features/{features_name}")
-        scored = score_features(model, config.FEATURES_DIR / features_name)
+        scored = score_features(model, config.FEATURES_DIR / features_name, feature_names)
         cache.parent.mkdir(parents=True, exist_ok=True)
         scored.to_parquet(cache, index=False)
 

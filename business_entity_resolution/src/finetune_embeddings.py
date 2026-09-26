@@ -74,18 +74,24 @@ def main() -> None:
     use_fp16 = torch.cuda.is_available()
     print(f"device: {'cuda: ' + torch.cuda.get_device_name(0) if use_fp16 else 'cpu'}", flush=True)
 
+    print(f"[1/4] loading model {args.model} (downloads on first run) ...", flush=True)
     model = SentenceTransformer(args.model)
     model.max_seq_length = args.max_seq_length
 
+    print("[2/4] loading training data ...", flush=True)
     train_ds = load_split(os.path.join(args.train_dir, "train.parquet"), args.prefix, args.max_train_rows or None)
     eval_ds = load_split(os.path.join(args.train_dir, "eval.parquet"), args.prefix, args.max_eval_rows or None)
-    print(f"train rows {len(train_ds):,}, eval rows {len(eval_ds):,}", flush=True)
+    steps = int(len(train_ds) / args.batch_size * args.epochs)
+    print(f"      train rows {len(train_ds):,}, eval rows {len(eval_ds):,} -> ~{steps:,} training steps", flush=True)
 
     evaluator = TripletEvaluator(
-        anchors=eval_ds["anchor"], positives=eval_ds["positive"], negatives=eval_ds["negative"], name="eval"
+        anchors=eval_ds["anchor"], positives=eval_ds["positive"], negatives=eval_ds["negative"], name="eval",
+        batch_size=256, show_progress_bar=True,
     )
+    print(f"[3/4] baseline: encoding {3 * len(eval_ds):,} eval texts ...", flush=True)
     before = evaluator(model)
     print(f"before fine-tuning: {before}", flush=True)
+    print(f"[4/4] training (progress bar below; eval accuracy printed every {args.eval_steps:,} steps) ...", flush=True)
 
     training_args = SentenceTransformerTrainingArguments(
         output_dir=args.checkpoint_dir,
@@ -99,7 +105,8 @@ def main() -> None:
         eval_strategy="steps",
         eval_steps=args.eval_steps,
         save_strategy="no",
-        logging_steps=100,
+        logging_steps=500,
+        disable_tqdm=False,
         report_to="none",
         seed=args.seed,
     )
@@ -113,6 +120,7 @@ def main() -> None:
     )
     t0 = time.time()
     trainer.train()
+    print("final evaluation ...", flush=True)
     after = evaluator(model)
     print(f"after fine-tuning: {after}  ({(time.time() - t0) / 60:.1f} min)", flush=True)
 

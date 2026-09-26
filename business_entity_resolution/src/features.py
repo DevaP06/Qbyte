@@ -118,6 +118,29 @@ FEATURE_COLUMNS = [
     "addr_tok_idf_cos_rank",
 ]
 
+# Added when the candidates come from candidate_generation.py (token blocking
+# union embedding retrieval) and so carry an embedding cosine for every pair.
+EMBEDDING_FEATURE_COLUMNS = [
+    "emb_cos",  # cosine of the two records' embeddings
+    "emb_rank",  # rank among the S1's embedding neighbours; NaN = not retrieved by embeddings
+    "emb_cos_gap",  # best emb_cos among this S1's candidates minus this one
+    "emb_cos_rank",  # rank by emb_cos among this S1's candidates
+    "from_token",  # 1 if token blocking retrieved the pair (score > 0)
+]
+
+
+def feature_columns_of(features_dir) -> list:
+    """The model feature columns of a features dataset, from its schema, in
+    order -- the base set, plus the embedding set if it was built from a
+    candidate union. Training and prediction both read the list from here."""
+    import pyarrow.parquet as pq
+
+    first = next(iter(sorted(features_dir.glob("part-*.parquet"))), None)
+    if first is None:
+        raise FileNotFoundError(f"no feature parts in {features_dir} -- run features.py first")
+    present = set(pq.read_schema(first).names)
+    return [c for c in FEATURE_COLUMNS + EMBEDDING_FEATURE_COLUMNS if c in present]
+
 
 # --------------------------------------------------------------------------
 # Small numeric helpers
@@ -500,6 +523,17 @@ def add_context_features(f: dict, sorted_q: np.ndarray, block_score: np.ndarray)
         f[f"{key}_rank"] = _rank_in_group(f[key], starts, sizes)
 
 
+def add_embedding_features(f: dict, sorted_q: np.ndarray, emb_score: np.ndarray, emb_rank: np.ndarray, block_score: np.ndarray) -> None:
+    """In place; same row order contract as add_context_features."""
+    starts = group_starts(sorted_q)
+    sizes = np.diff(np.r_[starts, len(sorted_q)])
+    f["emb_cos"] = emb_score.astype(np.float32)
+    f["emb_rank"] = emb_rank.astype(np.float32)
+    f["emb_cos_gap"] = _gap_to_group_max(f["emb_cos"], starts, sizes)
+    f["emb_cos_rank"] = _rank_in_group(f["emb_cos"], starts, sizes)
+    f["from_token"] = (block_score > 0).astype(np.float32)
+
+
 # --------------------------------------------------------------------------
 # Driver
 # --------------------------------------------------------------------------
@@ -523,26 +557,35 @@ def iter_feature_chunks(
     progress: Optional[ProgressBar] = None,
 ) -> Iterator[pd.DataFrame]:
     """Yield one feature DataFrame per S1-aligned chunk of `candidates`
-    (columns source1_entity_id, candidate_entity_id, score, country)."""
+    (columns source1_entity_id, candidate_entity_id, score; plus emb_score and
+    emb_rank for a candidate_generation.py union, which adds
+    EMBEDDING_FEATURE_COLUMNS)."""
     id_index = pd.Index(corpus.entity_ids)
     q_all = id_index.get_indexer(candidates["source1_entity_id"].to_numpy())
     t_all = id_index.get_indexer(candidates["candidate_entity_id"].to_numpy())
     assert (q_all >= 0).all() and (t_all >= 0).all(), "candidate id missing from the cleaned corpus"
     score_all = candidates["score"].to_numpy(dtype=np.float32)
+    has_emb = "emb_score" in candidates.columns
+    columns = FEATURE_COLUMNS + (EMBEDDING_FEATURE_COLUMNS if has_emb else [])
 
     order = np.lexsort((-score_all, q_all))
     q_all, t_all, score_all = q_all[order], t_all[order], score_all[order]
+    if has_emb:
+        emb_score_all = candidates["emb_score"].to_numpy(dtype=np.float32)[order]
+        emb_rank_all = candidates["emb_rank"].to_numpy(dtype=np.float32)[order]
 
     for start, end in chunk_bounds(group_starts(q_all), len(q_all), chunk_pairs):
         q, t = q_all[start:end], t_all[start:end]
         f = compute_pair_features(corpus, q, t)
         add_context_features(f, q, score_all[start:end])
+        if has_emb:
+            add_embedding_features(f, q, emb_score_all[start:end], emb_rank_all[start:end], score_all[start:end])
         out = pd.DataFrame(
             {
                 "source1_entity_id": corpus.entity_ids[q],
                 "candidate_entity_id": corpus.entity_ids[t],
                 "country": corpus.countries[q],
-                **{col: f[col].astype(np.float32) for col in FEATURE_COLUMNS},
+                **{col: f[col].astype(np.float32) for col in columns},
             }
         )
         if progress is not None:
@@ -564,17 +607,23 @@ def main() -> None:
         "--sample-entities", type=int, default=None,
         help="Only featurize candidates of N randomly chosen S1 entities (written to <split>_sample<N>/).",
     )
+    parser.add_argument(
+        "--candidates", default="token_blocking",
+        help="Candidate file stem under data/processed/candidates/<split>/ (e.g. a candidate_generation.py union).",
+    )
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
-    name = args.split if args.sample_entities is None else f"{args.split}_sample{args.sample_entities}"
+    name = args.split if args.candidates == "token_blocking" else f"{args.split}_{args.candidates}"
+    if args.sample_entities is not None:
+        name = f"{name}_sample{args.sample_entities}"
     dest = config.FEATURES_DIR / name
     if dest.exists() and not args.force:
         print(f"cache exists at {dest}, skipping (use --force to recompute)")
         return
 
     t0 = time.time()
-    candidates = pd.read_parquet(config.CANDIDATES_DIR / args.split / "token_blocking.parquet")
+    candidates = pd.read_parquet(config.CANDIDATES_DIR / args.split / f"{args.candidates}.parquet")
     if args.sample_entities is not None:
         candidates = _sample_candidates(candidates, args.sample_entities)
     print(f"loading corpus for {args.split} ...")
@@ -595,7 +644,7 @@ def main() -> None:
     if dest.exists():
         shutil.rmtree(dest)
     tmp.replace(dest)
-    print(f"  {len(candidates):,} pairs x {len(FEATURE_COLUMNS)} features in {time.time() - t1:.0f}s")
+    print(f"  {len(candidates):,} pairs x {len(feature_columns_of(dest))} features in {time.time() - t1:.0f}s")
     print(f"  written to: {dest}")
 
 

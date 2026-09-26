@@ -16,8 +16,10 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import config  # noqa: E402
 from features import (  # noqa: E402
+    EMBEDDING_FEATURE_COLUMNS,
     FEATURE_COLUMNS,
     build_feature_corpus,
+    feature_columns_of,
     chunk_bounds,
     group_starts,
     iter_feature_chunks,
@@ -68,7 +70,7 @@ def _write_cleaned_split(processed_dir: Path) -> None:
         pq.write_table(cleaned_chunk_to_table(cleaned), split_dir / f"{name}.parquet")
 
 
-def _featurize(chunk_pairs: int) -> pd.DataFrame:
+def _featurize(chunk_pairs: int, candidates: pd.DataFrame = CANDIDATES) -> pd.DataFrame:
     with tempfile.TemporaryDirectory() as tmp:
         original = config.DATA_PROCESSED_DIR
         config.DATA_PROCESSED_DIR = Path(tmp)
@@ -77,8 +79,17 @@ def _featurize(chunk_pairs: int) -> pd.DataFrame:
             corpus = build_feature_corpus("test")
         finally:
             config.DATA_PROCESSED_DIR = original
-    chunks = list(iter_feature_chunks(corpus, CANDIDATES, chunk_pairs=chunk_pairs))
+    chunks = list(iter_feature_chunks(corpus, candidates, chunk_pairs=chunk_pairs))
     return pd.concat(chunks, ignore_index=True).set_index(["source1_entity_id", "candidate_entity_id"])
+
+
+# A candidate_generation.py-style union: S3-2 found only by embeddings (token
+# score 0); S2-3 found only by tokens (no embedding rank).
+UNION_CANDIDATES = CANDIDATES.assign(
+    score=[9.0, 7.0, 8.0, 5.0, 0.0, 6.0],
+    emb_score=[0.95, 0.90, 0.92, 0.80, 0.30, 0.99],
+    emb_rank=[0.0, 1.0, 0.0, np.nan, 1.0, 0.0],
+)
 
 
 FEATURES = None
@@ -168,6 +179,27 @@ def test_chunking_never_splits_an_entity_and_is_deterministic():
     tiny = _featurize(chunk_pairs=1).sort_index()
     whole = _features().sort_index()
     pd.testing.assert_frame_equal(tiny, whole)
+
+
+def test_embedding_features_from_union_candidates():
+    f = _featurize(chunk_pairs=1_000, candidates=UNION_CANDIDATES)
+    assert list(f.columns) == ["country"] + FEATURE_COLUMNS + EMBEDDING_FEATURE_COLUMNS
+    us = f.loc["S1-2"]
+    assert us.loc["S3-2", "from_token"] == 0.0 and us.loc["S3-1", "from_token"] == 1.0
+    assert np.isnan(us.loc["S2-3", "emb_rank"])  # tokens only -> not an embedding neighbour
+    assert math.isclose(us.loc["S3-1", "emb_cos"], 0.92, rel_tol=1e-6)
+    assert us.loc["S3-1", "emb_cos_gap"] == 0.0 and us.loc["S3-1", "emb_cos_rank"] == 0.0
+    assert math.isclose(us.loc["S3-2", "emb_cos_gap"], 0.62, abs_tol=1e-6)
+    assert us.loc["S3-2", "block_rank"] == 2.0  # embedding-only pairs rank after every token pair
+
+
+def test_feature_columns_of_reads_the_schema():
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp)
+        _featurize(chunk_pairs=1_000, candidates=UNION_CANDIDATES).reset_index().to_parquet(d / "part-00000.parquet")
+        assert feature_columns_of(d) == FEATURE_COLUMNS + EMBEDDING_FEATURE_COLUMNS
+        _features().reset_index().to_parquet(d / "part-00000.parquet")
+        assert feature_columns_of(d) == FEATURE_COLUMNS
 
 
 def main() -> None:
