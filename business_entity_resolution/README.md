@@ -1,76 +1,136 @@
 # Business Entity Resolution
 
-Source package for the entity resolution solution (blocking + matching).
-See `../plan.md` for the full pipeline plan.
+Matches every Source 1 business to its records in Source 2 / Source 3.
+Final version **v2.5**: dev_val macro F0.5 0.98921 (2-fold CV, India 0.99000 /
+US 0.98868), portal 0.985226.
 
-## Status
+Pipeline: cleaning → token blocking ∪ fine-tuned embedding retrieval →
+57 pair features → XGBoost → three cross-encoder rounds (multilingual-e5-small)
++ a multilingual-e5-base cross-encoder on uncertain pairs → level-2 XGBoost
+stacker → threshold + one-S1-per-record post-processing → export.
+Methodology and measurements: `Documentation_template.md` at the zip root.
 
-**Implemented** (plan.md build order steps 1–5):
+## Layout
 
-| Step | Module | Output |
-|---|---|---|
-| 1. Cleaning | `clean_all.py` (`normalize.py`, `address_parser.py`, `io_utils.py`) | `data/processed/<split>/source{1,2,3}.parquet` |
-| 2. Token blocking | `blocking_token.py` | `data/processed/candidates/<split>/token_blocking.parquet` |
-| 3. Features + labels | `features.py`, `labels.py` | `data/processed/features/<split>/part-*.parquet` |
-| 4. Classifier + threshold | `train_classifier.py`, `threshold_tuning.py`, `evaluate.py` | `data/processed/models/<run>/` |
-| 5. Predict + post-process + export | `predict.py`, `postprocess.py`, `export.py` | `output/matching_results.tsv`, `output/candidate_pairs.tsv` |
+The code resolves every path from its own location (`src/config.py`):
 
-Best dev_val macro F0.5 so far: 0.9465 (XGBoost on GPU, 2000-round cap;
-candidate-set ceiling 0.9669).
+```
+<root>/                          # "code/" inside the submission zip
+├── business_entity_resolution/
+│   ├── src/                     # all code; run every command from here
+│   ├── README.md
+│   └── requirements.txt
+├── data/raw/train/              # source1.tsv source2.tsv source3.tsv train_ground_truth.tsv
+├── data/raw/test/               # source1.tsv source2.tsv source3.tsv
+├── utils/validate_submission.py # the challenge's validator (student resource)
+└── output/                      # written by the pipeline
+```
 
-**In progress:** retrieval-embedding fine-tuning (`finetune_data.py`,
-`finetune_embeddings.py`, `../sagemaker/launch_finetune.py` — data export
-and training script done, retrieval integration not yet).
-**Not yet implemented:** embedding retrieval in blocking (steps 6–7),
-optional reranker.
+Intermediate artifacts go to `<root>/data/processed/` (the union features alone
+are ~10 GB per split).
 
-## Usage
+## Environment
 
-Run from `business_entity_resolution/src/`. Every stage caches its output and
-skips if present; pass `--force` to recompute.
+Python 3.12, CUDA GPU (we used an RTX 2000 Ada 16 GB for everything except the
+e5-base cross-encoder, which ran on an RTX 4000 Ada 20 GB), 32 CPU threads,
+64 GB RAM (full GBDT training needs 30–40 GB).
 
 ```bash
+cd business_entity_resolution/src
 pip install -r ../requirements.txt
+```
 
-python clean_all.py                       # ~10 min, all six source files
-python blocking_token.py --split train    # ~15 min; prints recall ceiling vs ground truth
-python blocking_token.py --split test     # ~11 min
-python features.py --split train          # ~13 min, 88M pairs
-python features.py --split test           # ~12 min, 69M pairs
-python labels.py --features train         # label coverage report (optional)
-python train_classifier.py --run dev_gpu --gpu [--loco]   # dev split, threshold, per-country (+ LOCO) F0.5
-python train_classifier.py --mode final --gpu --dev-run dev_gpu --run final_gpu   # all train, locked threshold
-python predict.py --run final_gpu          # -> ../../output/*.tsv
+Models (all MIT, downloaded from the Hugging Face Hub on first use, then
+fine-tuned on the training data only): `intfloat/multilingual-e5-small`
+(118M), `intfloat/multilingual-e5-base` (278M). No hosted APIs, no external
+data.
+
+## Reproduce end to end
+
+Every stage caches its output and skips work already done (`--force` recomputes).
+Each command shows its own progress bar; the `run_*.py` runners add a
+whole-pipeline bar. Seeds are fixed (42); GPU training is not bit-exact, so a
+re-run may differ in the 4th decimal.
+
+```bash
+# 1. Cleaning (~10 min)
+python clean_all.py
+
+# 2. Token blocking: IDF-selected keys per country, top-40 per S1 (~15 + 11 min)
+python blocking_token.py --split train
+python blocking_token.py --split test
+
+# 3. Retriever: fine-tune multilingual-e5-small on (S1, match, hard negative) triplets
+python finetune_data.py
+python finetune_embeddings.py --train-dir ../../data/processed/finetune \
+    --output-dir ../../data/processed/models/retriever \
+    --checkpoint-dir ../../data/processed/models/retriever_ckpt
+
+# 4. Embed + exact kNN per country, union with token candidates (k=20), 57 features,
+#    dev GBDT "dev_v11" (threshold tuned on dev_val), then the final GBDT on all train
+python embeddings.py --split train --k 50
+python run_union_pipeline.py --force-features --run dev_v11
+python train_classifier.py --mode final --gpu --features train_union_retriever_k20 \
+    --dev-run dev_v11 --run final_v11
+python predict.py --run final_v11 --features test_union_retriever_k20
+
+# 5. Cross-encoder round 1 (from the retriever), re-scores pairs with GBDT >= 0.02
+python cross_encoder.py export
+python cross_encoder.py train
+python cross_encoder.py score
+
+# 6. Round 2 (+ France agreement pairs) and the level-2 stacker (v2.2)
+python run_v22.py
+# 7. Round 3 (+ synthetic French negatives/positives, French S1-S1 negatives) (v2.3)
+python run_v23.py
+# 8. multilingual-e5-base cross-encoder on uncertain pairs (v2.5); the budget sets how
+#    many training pairs are used (benchmarked on the GPU; we used 110 min on an RTX 4000 Ada)
+python run_v25.py --budget-min 110
+
+# 9. Final submission (run_v25.py ends with exactly this when its gate passes)
+python stack2.py apply --bag 5 --coherence --tag _r2,_r3 --extra-tag _base
 cd ../.. && python utils/validate_submission.py --matching output/matching_results.tsv \
     --candidate output/candidate_pairs.tsv --test-dir data/raw/test --check-ids
 ```
 
-`--gpu` trains XGBoost on CUDA (the PyPI LightGBM wheel has no GPU support);
-without it, LightGBM on CPU. Full-data training needs ~30–40GB host RAM; add
-`--fit-entity-frac 0.3` on smaller machines.
+Step 8 on a second machine instead: `python ce_base.py export` here, copy
+`data/raw/train/train_ground_truth.tsv`, `data/processed/{train,test}/` and
+`data/processed/cross_encoder/{train_base,eval,val_scores_r3,test_scores_r3}.parquet`
+over, run `python run_e5_remote.py --budget-min 110` there, copy back
+`val_scores_base.parquet` / `test_scores_base.parquet`, then run step 9.
 
-Quick iteration on a sample: `features.py --split train --sample-entities 100000`
-then `train_classifier.py --features train_sample100000 --run smoke`.
-Timings measured on a 32-thread / 64GB machine.
+Outputs: `output/matching_results.tsv` (one row per test S1 entity) and
+`output/candidate_pairs.tsv` (the 97,191,350 union candidate pairs the models
+scored), both tab-separated with `\n` line endings.
 
-Tests (stdlib `assert`-based, no pytest dependency):
+## Leakage guards
+
+`train_classifier.split_entities` (seed 42) splits train S1 entities into
+fit / early-stop / dev_val. Retriever and cross-encoder training use fit
+entities only (`_assert_no_dev_val` in `cross_encoder.py`); the stacker is
+trained on dev_val pairs, which neither base model saw, and evaluated by 2-fold
+CV by entity. Test data is used only as unlabeled text (French agreement pairs
+are pairs where two independent models agree).
+
+## Tests
+
+stdlib `assert`-based, no pytest needed (run from `business_entity_resolution/`):
 
 ```bash
-for t in normalize address_parser blocking_token features labels evaluate export; do
+for t in normalize address_parser blocking_token features labels evaluate export competition embeddings; do
   python tests/test_$t.py
 done
-python tests/smoke_test_real_data.py   # real-data sample checks for cleaning
 ```
 
 ## Design notes
 
 - **Country is an open set.** Every stage groups by whatever string is in
-  `country` (blocking partitions, feature IDF, entity split) — no country
-  list, no per-country table, no one-hot. France, absent from train, takes
-  the identical code path at test time.
-- **Metric fidelity.** `evaluate.py` implements macro F0.5 exactly as
-  PROBLEM_STATEMENT.md defines it, averaged over *every* S1 entity —
-  including singletons and entities blocking gave no candidates — and the
-  threshold is tuned against that metric directly, never a proxy.
-- Stage-specific decisions, deviations from plan.md, and the measurements
-  behind them are documented in each module's docstring.
+  `country` (blocking partitions, feature IDF, kNN, entity split). No country
+  list, no per-country table, no one-hot. France, absent from train, takes the
+  identical code path at test time.
+- **Metric fidelity.** `evaluate.py` implements macro F0.5 exactly as the
+  problem statement defines it, averaged over every S1 entity (including
+  singletons and entities with no candidates). Thresholds are tuned against
+  that metric directly.
+- Stage-specific decisions and the measurements behind them are in each
+  module's docstring.
