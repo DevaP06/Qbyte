@@ -31,8 +31,9 @@ import pyarrow.parquet as pq
 
 import config
 from finetune_data import record_texts
+from io_utils import read_cleaned_table
 from labels import PairLabeler, entity_truth, ground_truth_pairs, load_ground_truth
-from train_classifier import ROLE_EARLY_STOP, ROLE_FIT, Progress, _stage, split_entities
+from train_classifier import ROLE_EARLY_STOP, ROLE_FIT, ROLE_VAL, Progress, _stage, split_entities
 
 CE_DIR = config.DATA_PROCESSED_DIR / "cross_encoder"
 CE_MODEL_DIR = config.MODELS_DIR / "cross_encoder"
@@ -103,6 +104,218 @@ def export_round2(n_entities: int, france_per_class: int, negatives_per_entity: 
     out.to_parquet(CE_DIR / "train_r2.parquet", index=False)
     print(f"  round-2 train: {len(pairs):,} labelled pairs from {min(n_entities, len(fresh)):,} new fit entities "
           f"+ {len(france):,} France agreement pairs ({len(pos):,} match / {len(neg):,} non-match) -> train_r2.parquet", flush=True)
+
+
+_LEGAL_FR = frozenset("sarl sas sasu eurl sa sci snc ei selarl scp scm sca gie cie".split())
+
+
+def _street_component(address: str) -> tuple[int, str, str]:
+    """(index, component, house number) of the first comma component with a
+    digit, or (-1, "", "")."""
+    for i, comp in enumerate(address.split(",")):
+        for tok in comp.split():
+            if tok.isdigit():
+                return i, comp.strip(), tok
+    return -1, "", ""
+
+
+def synthetic_french_negatives(pos: pd.DataFrame, texts_name: pd.Series, texts_addr: pd.Series, n: int, seed: int) -> pd.DataFrame:
+    """Hard negatives built from confident French matches, mimicking the two
+    distractor patterns France fails on (STATUS.md):
+      word swap   - the candidate's business word replaced by another French
+                    business word ("lutins comite sas" -> "lutins institut sas")
+      street swap - same house number, another street of the same city+region
+    Uses only test text (no external data). Returns S1 text / candidate text pairs, label 0."""
+    rng = np.random.default_rng(seed)
+    s1_ids, cand_ids = pos["source1_entity_id"].to_numpy(), pos["candidate_entity_id"].to_numpy()
+    cand_name = texts_name.reindex(cand_ids).fillna("").to_numpy()
+    cand_addr = texts_addr.reindex(cand_ids).fillna("").to_numpy()
+    s1_text = (texts_name.reindex(s1_ids).fillna("") + ", " + texts_addr.reindex(s1_ids).fillna("")).str.strip(", ").to_numpy()
+
+    # business-word vocabulary: frequent French S1 name tokens that are neither legal forms nor place words
+    s1_names = texts_name.reindex(np.unique(s1_ids)).fillna("")
+    place = set(t for a in texts_addr.reindex(np.unique(s1_ids)).fillna("") for t in a.replace(",", " ").split())
+    counts = pd.Series([t for nm in s1_names for t in nm.split()]).value_counts()
+    vocab = [t for t, c in counts.items() if c >= 200 and t.isalpha() and len(t) > 2 and t not in _LEGAL_FR and t not in place]
+    vocab_set = set(vocab)
+
+    # street donors grouped by the S1's non-street address components (city + region)
+    city_key = [",".join(sorted(c.strip() for c in a.split(",") if not any(ch.isdigit() for ch in c))) for a in cand_addr]
+    donors: dict = {}
+    for key, a in zip(city_key, cand_addr):
+        _, comp, _ = _street_component(a)
+        if comp:
+            donors.setdefault(key, []).append(comp)
+
+    rows = []
+    for i in rng.permutation(len(pos)):
+        if len(rows) >= n:
+            break
+        if rng.random() < 0.8:  # word swap (tried first more often: it only applies when a business word is present)
+            toks = cand_name[i].split()
+            spots = [j for j, t in enumerate(toks) if t in vocab_set]
+            if not spots:
+                continue
+            j = spots[rng.integers(len(spots))]
+            new = vocab[rng.integers(len(vocab))]
+            if new == toks[j]:
+                continue
+            toks[j] = new
+            cand = ", ".join(x for x in (" ".join(toks), cand_addr[i]) if x)
+            kind = "word_swap"
+        else:  # street swap, same number
+            idx, comp, number = _street_component(cand_addr[i])
+            pool = donors.get(city_key[i], [])
+            if idx < 0 or len(pool) < 2:
+                continue
+            donor = pool[rng.integers(len(pool))]
+            _, _, d_num = _street_component(donor)
+            new_comp = donor.replace(d_num, number, 1) if d_num else donor
+            if new_comp.replace(number, "").strip() == comp.replace(number, "").strip():
+                continue
+            parts = cand_addr[i].split(",")
+            parts[idx] = " " + new_comp if idx else new_comp
+            cand = ", ".join(x for x in (cand_name[i], ",".join(parts).strip()) if x)
+            kind = "street_swap"
+        rows.append((s1_ids[i], f"synthetic:{cand_ids[i]}", s1_text[i], cand, 0, kind))
+    return pd.DataFrame(rows, columns=["source1_entity_id", "candidate_entity_id", "text_a", "text_b", "label", "kind"])
+
+
+_ABBREV = [("avenue", "av"), ("boulevard", "bd"), ("rue", "r"), ("place", "pl"), ("chemin", "ch"),
+           ("impasse", "imp"), ("allée", "all"), ("allee", "all"), ("route", "rte"), ("quai", "qu")]
+
+
+def _fold_accents(text: str) -> str:
+    import unicodedata
+    return "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c))
+
+
+def synthetic_french_positives(pos: pd.DataFrame, texts: pd.Series, n: int, seed: int) -> pd.DataFrame:
+    """Noisy copies of confident French matches (label stays 1): legal form
+    stripped, accents folded, street type abbreviated/expanded, articles dropped,
+    'bis' toggled, or a one-character typo -- the variations a true French
+    match shows, so the CE learns they do NOT signal a different business."""
+    rng = np.random.default_rng(seed + 7)
+    rows = []
+    sample = pos.sample(min(n, len(pos)), random_state=seed)
+    for s1, cand in zip(sample["source1_entity_id"], sample["candidate_entity_id"]):
+        a, b = texts.get(s1, ""), texts.get(cand, "")
+        if not a or not b:
+            continue
+        for _ in range(int(rng.integers(1, 3))):
+            op = int(rng.integers(6))
+            if op == 0:
+                b = " ".join(t for t in b.split(" ") if t.strip(",") not in _LEGAL_FR)
+            elif op == 1:
+                b = _fold_accents(b)
+            elif op == 2:
+                full, short = _ABBREV[int(rng.integers(len(_ABBREV)))]
+                b = b.replace(f" {full} ", f" {short} ", 1) if f" {full} " in b else b.replace(f" {short} ", f" {full} ", 1)
+            elif op == 3:
+                for art in (" de la ", " du ", " des ", " de l'", " d'"):
+                    b = b.replace(art, " ", 1)
+            elif op == 4:
+                b = b.replace(" bis ", " ", 1) if " bis " in b else b
+            else:
+                toks = b.split(" ")
+                idx = [i for i, t in enumerate(toks) if t.isalpha() and len(t) > 3]
+                if idx:
+                    i = idx[int(rng.integers(len(idx)))]
+                    j = int(rng.integers(len(toks[i]) - 1))
+                    t = toks[i]
+                    toks[i] = t[:j] + t[j + 1] + t[j] + t[j + 2:]
+                    b = " ".join(toks)
+        rows.append((s1, f"synthetic_pos:{cand}", a, " ".join(b.split()), 1))
+    return pd.DataFrame(rows, columns=["source1_entity_id", "candidate_entity_id", "text_a", "text_b", "label"])
+
+
+def s1_s1_negatives(n: int, seed: int) -> pd.DataFrame:
+    """Free, CORRECT negatives for France: Source 1 is deduplicated, so any two
+    distinct S1 records are different entities. Mine French S1 pairs in the same
+    city+region that share the first name word ("lille ecole sas" vs "lille
+    ecole club") or the street component (a different business at the same
+    street) -- real versions of the distractors France fails on."""
+    rng = np.random.default_rng(seed + 11)
+    t = read_cleaned_table("test", "source1", columns=["entity_id", "country", "name_original_normalized", "address_normalized"]).to_pandas()
+    t = t[t["country"] == "France"].fillna("")
+    t["text"] = (t["name_original_normalized"] + ", " + t["address_normalized"]).str.strip(", ")
+    t["city"] = [",".join(sorted(c.strip() for c in a.split(",") if c.strip() and not any(ch.isdigit() for ch in c))) for a in t["address_normalized"]]
+    t["head"] = t["name_original_normalized"].str.split(" ").str[0]
+    t["street"] = [_street_component(a)[1] for a in t["address_normalized"]]
+    pairs = []
+    per_kind = n // 2
+    for key_cols in (["city", "head"], ["city", "street"]):
+        groups = [g.index.to_numpy() for _, g in t[t[key_cols[1]] != ""].groupby(key_cols) if len(g) > 1]
+        rng.shuffle(groups)
+        taken = 0
+        for idx in groups:
+            if taken >= per_kind:
+                break
+            i, j = rng.choice(idx, size=2, replace=False)
+            if t.at[i, "text"] != t.at[j, "text"]:
+                pairs.append((t.at[i, "entity_id"], t.at[j, "entity_id"], t.at[i, "text"], t.at[j, "text"], 0))
+                taken += 1
+    return pd.DataFrame(pairs, columns=["source1_entity_id", "candidate_entity_id", "text_a", "text_b", "label"])
+
+
+def _assert_no_dev_val(frame: pd.DataFrame, truth: pd.DataFrame, roles: np.ndarray) -> None:
+    """Global rule: no dev_val entity may appear in any CE training set."""
+    val_ids = set(truth["source1_entity_id"].to_numpy()[roles == ROLE_VAL])
+    leaked = set(frame["source1_entity_id"]) & val_ids
+    assert not leaked, f"dev_val leakage: {len(leaked)} dev_val entities in CE training data"
+
+
+def export_round3(n_entities: int, france_per_class: int, n_synthetic: int, n_synth_pos: int, n_s1_neg: int,
+                  negatives_per_entity: int, seed: int) -> None:
+    """Round-3 data (all from fit entities or unlabeled test; dev_val asserted absent):
+      replay      fresh India/US fit entities round 1/2 never saw (no forgetting)
+      agreement   France pairs where GBDT and the ROUND-2 CE agree (>= 0.98 match;
+                  CE <= 0.02 with GBDT < 0.5 non-match)
+      synth neg   French business-word swaps / same number, other street
+      synth pos   noisy copies of confident French matches (legal form, accents,
+                  abbreviations, articles, bis, typo)
+      S1-S1 neg   distinct French S1 records sharing name head or street (dedup => different)"""
+    rng = np.random.default_rng(seed + 2)
+    gt = load_ground_truth()
+    truth = entity_truth(gt)
+    roles = split_entities(truth["country"].to_numpy())
+    used = set()
+    for f in ("train.parquet", "train_r2.parquet"):
+        used |= set(pd.read_parquet(CE_DIR / f, columns=["source1_entity_id"])["source1_entity_id"])
+    fresh = np.array([i for i in truth["source1_entity_id"].to_numpy()[roles == ROLE_FIT] if i not in used])
+    replay = _labelled_pairs(set(rng.choice(fresh, size=min(n_entities, len(fresh)), replace=False)), gt, negatives_per_entity, seed)
+    _assert_no_dev_val(replay, truth, roles)
+
+    _stage("France agreement pairs (GBDT + round-2 CE)")
+    ts = pd.read_parquet(CE_DIR / "test_scores_r2.parquet")
+    fr = ts[ts["country"] == "France"]
+    pos = fr[(fr["score"] >= 0.98) & (fr["ce"] >= 0.98)]
+    pos = pos.sort_values("ce", ascending=False).drop_duplicates("candidate_entity_id")  # one S1 per French record
+    neg = fr[(fr["ce"] <= 0.02) & (fr["score"] < 0.5)]
+    pos_s = pos.sample(min(france_per_class, len(pos)), random_state=seed).assign(label=1)
+    neg_s = neg.sample(min(france_per_class, len(neg)), random_state=seed).assign(label=0)
+    texts = record_texts("test")
+    agree = pd.concat([pos_s, neg_s])
+    agree = agree.assign(
+        text_a=texts.reindex(agree["source1_entity_id"]).to_numpy(),
+        text_b=texts.reindex(agree["candidate_entity_id"]).to_numpy(),
+    )[["source1_entity_id", "candidate_entity_id", "text_a", "text_b", "label"]]
+
+    _stage("synthetic French negatives + positives, and S1-S1 negatives")
+    cleaned = pd.concat([read_cleaned_table("test", s, columns=["entity_id", "name_original_normalized", "address_normalized"]).to_pandas()
+                         for s in ("source1", "source2", "source3")]).set_index("entity_id")
+    synth = synthetic_french_negatives(pos, cleaned["name_original_normalized"], cleaned["address_normalized"], n_synthetic, seed)
+    synth_pos = synthetic_french_positives(pos, texts, n_synth_pos, seed)
+    s1neg = s1_s1_negatives(n_s1_neg, seed)
+
+    out = pd.concat([replay, agree, synth.drop(columns="kind"), synth_pos, s1neg]).sample(frac=1.0, random_state=seed)
+    out.to_parquet(CE_DIR / "train_r3.parquet", index=False)
+    print(f"  round-3 train {len(out):,} pairs: replay {len(replay):,} | France agreement {len(agree):,} "
+          f"({len(pos_s):,} match / {len(neg_s):,} non-match) | synthetic neg {len(synth):,} {synth['kind'].value_counts().to_dict()} "
+          f"| synthetic pos {len(synth_pos):,} | S1-S1 neg {len(s1neg):,} | positive share {out['label'].mean() * 100:.1f}%", flush=True)
+    for title, frame in (("synthetic NEG", synth.head(2)), ("synthetic POS", synth_pos.head(2)), ("S1-S1 NEG", s1neg.head(2))):
+        for _, r in frame.iterrows():
+            print(f"    [{title}] {r.text_a}\n       vs {r.text_b}", flush=True)
 
 
 def export(n_entities: int, negatives_per_entity: int, seed: int) -> None:
@@ -271,6 +484,10 @@ def main() -> None:
     e.add_argument("--seed", type=int, default=config.SPLIT_SEED)
     e.add_argument("--round2", action="store_true", help="New fit entities + France agreement pairs -> train_r2.parquet.")
     e.add_argument("--france-per-class", type=int, default=200_000)
+    e.add_argument("--round3", action="store_true", help="Replay + France agreement (round-2 CE) + synthetic negatives -> train_r3.parquet.")
+    e.add_argument("--synthetic", type=int, default=150_000, help="Round 3: synthetic French hard negatives.")
+    e.add_argument("--synthetic-pos", type=int, default=100_000, help="Round 3: synthetic French positives.")
+    e.add_argument("--s1-negatives", type=int, default=150_000, help="Round 3: French S1-S1 negatives.")
     t = sub.add_parser("train")
     t.add_argument("--base-model", default=str(config.MODELS_DIR / "retriever"))
     t.add_argument("--train-file", default="train.parquet")
@@ -294,7 +511,10 @@ def main() -> None:
     b.add_argument("--out-dir", default=str(config.OUTPUT_DIR))
     args = parser.parse_args()
     if args.cmd == "export":
-        if args.round2:
+        if args.round3:
+            export_round3(args.entities, args.france_per_class, args.synthetic, args.synthetic_pos, args.s1_negatives,
+                          args.negatives, args.seed)
+        elif args.round2:
             export_round2(args.entities, args.france_per_class, args.negatives, args.seed)
         else:
             export(args.entities, args.negatives, args.seed)

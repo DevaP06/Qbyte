@@ -42,6 +42,8 @@ KEY = ["source1_entity_id", "candidate_entity_id"]
 PARAMS = {"objective": "binary:logistic", "eval_metric": "logloss", "tree_method": "hist", "max_depth": 6,
           "learning_rate": 0.1, "subsample": 0.8, "colsample_bytree": 0.8, "min_child_weight": 20, "seed": 42}
 ROUNDS = 300
+EMB_DIR = config.DATA_PROCESSED_DIR / "embeddings" / "retriever"
+EMB_DIM = 384
 
 
 def _attach_features(scored: pd.DataFrame, features_dir: Path) -> pd.DataFrame:
@@ -59,8 +61,41 @@ def _attach_features(scored: pd.DataFrame, features_dir: Path) -> pd.DataFrame:
     return scored.merge(pd.concat(out, ignore_index=True), on=KEY, how="left")
 
 
+def add_coherence(d: pd.DataFrame, split: str) -> pd.DataFrame:
+    """Sibling coherence: an S1's true matches are noisy copies of each other.
+    For each pair, the embedding cosine between the candidate and the S1's
+    strongest OTHER candidate (by GBDT score), and whether they come from
+    different sources. NaN when the S1 has no other scored candidate."""
+    ids = np.load(EMB_DIR / f"{split}.ids.npy", allow_pickle=True)
+    emb = np.memmap(EMB_DIR / f"{split}.f16", dtype=np.float16, mode="r", shape=(len(ids), EMB_DIM))
+    order = d.sort_values(["source1_entity_id", "score"], ascending=[True, False])
+    top = order.groupby("source1_entity_id")["candidate_entity_id"].agg(lambda s: list(s.iloc[:2]))
+    tops = top.reindex(d["source1_entity_id"]).to_numpy()
+    cand = d["candidate_entity_id"].to_numpy()
+    partner = np.array([t[0] if t[0] != c else (t[1] if len(t) > 1 else None) for t, c in zip(tops, cand)], dtype=object)
+    index = pd.Index(ids)
+    rc = index.get_indexer(cand)
+    has = pd.notna(partner)
+    rp = np.full(len(d), -1)
+    rp[has] = index.get_indexer(partner[has])
+    cos = np.full(len(d), np.nan, dtype=np.float32)
+    ok = np.flatnonzero((rc >= 0) & (rp >= 0))
+    bar = Progress(len(ok), "coherence", "pairs")
+    for s0 in range(0, len(ok), 1_000_000):
+        sl = ok[s0 : s0 + 1_000_000]
+        a = np.asarray(emb[np.sort(rc[sl])], dtype=np.float32)[np.argsort(np.argsort(rc[sl]))]
+        b = np.asarray(emb[np.sort(rp[sl])], dtype=np.float32)[np.argsort(np.argsort(rp[sl]))]
+        cos[sl] = np.einsum("ij,ij->i", a, b)
+        bar.update(min(s0 + 1_000_000, len(ok)))
+    bar.close()
+    other_src = np.where(has, pd.Series(cand).str[:2].to_numpy() != pd.Series(partner).astype(str).str[:2].to_numpy(), np.nan)
+    return d.assign(coh_cos=cos, coh_other_source=other_src.astype(np.float32))
+
+
 def _design(d: pd.DataFrame) -> np.ndarray:
-    """Stacker inputs: both scores (logits), their S1-local context, pair evidence."""
+    """Stacker inputs: both scores (logits), their S1-local context, pair evidence;
+    plus the second CE's logit and its disagreement with the first when two CE
+    rounds are stacked."""
     d = d.copy()
     d["lg"], d["lc"] = _logit(d["score"].to_numpy()), _logit(d["ce"].to_numpy())
     g = d.groupby("source1_entity_id")
@@ -70,12 +105,46 @@ def _design(d: pd.DataFrame) -> np.ndarray:
     d["n_scored"] = g["ce"].transform("size")
     d["disagree"] = d["lg"] - d["lc"]
     cols = ["lg", "lc", "ce_rank", "ce_gap", "gbdt_rank", "n_scored", "disagree"] + PAIR_FEATURES
+    if "ce2" in d.columns:
+        d["lc2"] = _logit(d["ce2"].fillna(d["ce"]).to_numpy())
+        d["ce_rounds_diff"] = d["lc"] - d["lc2"]
+        cols += ["lc2", "ce_rounds_diff"]
+    if "coh_cos" in d.columns:
+        cols += ["coh_cos", "coh_other_source"]
     return d[cols].to_numpy(np.float32)
 
 
-def _val_frame(val_run: str, tag: str = "") -> pd.DataFrame:
-    vce = pd.read_parquet(CE_DIR / f"val_scores{tag}.parquet")
-    return _attach_features(vce, config.FEATURES_DIR / f"train_{UNION}")
+def _tags(spec: str) -> list:
+    """'_r2,_r3' -> ['_r2', '_r3']. The LAST tag is the primary CE ('ce'); the
+    first (if two) is stacked as 'ce2'. An empty tag means round 1."""
+    return spec.split(",")
+
+
+def _suffix(tags: list, bag: int, coherence: bool = False) -> str:
+    return "".join(tags) + (f"_bag{bag}" if bag > 1 else "") + ("_coh" if coherence else "")
+
+
+def _scores(kind: str, tags: list) -> pd.DataFrame:
+    base = pd.read_parquet(CE_DIR / f"{kind}_scores{tags[-1]}.parquet")
+    if len(tags) > 1:
+        other = pd.read_parquet(CE_DIR / f"{kind}_scores{tags[0]}.parquet", columns=KEY + ["ce"]).rename(columns={"ce": "ce2"})
+        base = base.merge(other, on=KEY, how="left")
+    return base
+
+
+def _val_frame(val_run: str, tags: list, coherence: bool = False) -> pd.DataFrame:
+    d = _attach_features(_scores("val", tags), config.FEATURES_DIR / f"train_{UNION}")
+    return add_coherence(d, "train") if coherence else d
+
+
+def _fit(X: np.ndarray, y: np.ndarray, bag: int) -> list:
+    """`bag` XGBoost stackers with different seeds (different row/column subsamples)."""
+    return [xgb.train({**PARAMS, "seed": PARAMS["seed"] + i}, xgb.DMatrix(X, label=y), ROUNDS) for i in range(bag)]
+
+
+def _predict(boosters: list, X: np.ndarray) -> np.ndarray:
+    dm = xgb.DMatrix(X)
+    return np.mean([b.predict(dm) for b in boosters], axis=0)
 
 
 def _macro(pairs: pd.DataFrame, thr: float, val_ent: pd.DataFrame) -> pd.Series:
@@ -88,71 +157,61 @@ def _macro(pairs: pd.DataFrame, thr: float, val_ent: pd.DataFrame) -> pd.Series:
     return s
 
 
-def cv(val_run: str, tag: str = "") -> None:
-    from sklearn.linear_model import LogisticRegression
+def _oof(d: pd.DataFrame, bag: int) -> np.ndarray:
+    """2-fold out-of-fold stacker scores, folds by S1 entity."""
+    fold = (pd.util.hash_pandas_object(d["source1_entity_id"], index=False).to_numpy() % 2).astype(int)
+    X, y = _design(d), d["label"].to_numpy()
+    oof = np.zeros(len(d))
+    bar = Progress(2, "cv folds", "folds")
+    for k in (0, 1):
+        oof[fold == k] = _predict(_fit(X[fold != k], y[fold != k], bag), X[fold == k])
+        bar.update(k + 1)
+    bar.close()
+    return oof
 
-    _stage("loading dev_val pairs + features")
-    d = _val_frame(val_run, tag)
+
+def _tuned(val_run: str, d: pd.DataFrame, oof: np.ndarray):
+    """(threshold, per-country macro F0.5) of OOF stacker scores over all dev_val entities."""
     val_all = pd.read_parquet(config.MODELS_DIR / val_run / "val_predictions.parquet")
     truth = entity_truth(load_ground_truth())
     val_mask = split_entities(truth["country"].to_numpy()) == ROLE_VAL
     val_ent = truth[val_mask].set_index("source1_entity_id")
-    codes_all = pd.Index(truth["source1_entity_id"]).get_indexer(val_all["source1_entity_id"])
-
-    fold = (pd.util.hash_pandas_object(d["source1_entity_id"], index=False).to_numpy() % 2).astype(int)
-    X, y = _design(d), d["label"].to_numpy()
-    oof_stack, oof_lin = np.zeros(len(d)), np.zeros(len(d))
-    _stage("2-fold CV by entity")
-    bar = Progress(2, "cv folds", "folds")
-    for k in (0, 1):
-        tr, te = fold != k, fold == k
-        booster = xgb.train(PARAMS, xgb.DMatrix(X[tr], label=y[tr]), ROUNDS)
-        oof_stack[te] = booster.predict(xgb.DMatrix(X[te]))
-        lin = LogisticRegression().fit(X[tr][:, :2], y[tr])
-        oof_lin[te] = lin.predict_proba(X[te][:, :2])[:, 1]
-        bar.update(k + 1)
-    bar.close()
-
-    results = {}
-    for name, s in (("linear blend (v2.0)", oof_lin), ("level-2 stacker", oof_stack)):
-        pairs = val_all.merge(d[KEY].assign(new=s), on=KEY, how="left")
-        pairs["score"] = pairs["new"].fillna(pairs["score"])
-        thr = tune_threshold(codes_all, pairs["score"].to_numpy(), pairs["label"].to_numpy(), truth["n_true"].to_numpy(), val_mask).threshold
-        results[name] = _macro(pairs, thr, val_ent)
-        results[name]["threshold"] = thr
-    base_thr = json.loads((config.MODELS_DIR / val_run / "metrics.json").read_text())["threshold"]
-    results["GBDT only"] = _macro(val_all, base_thr, val_ent)
-    print(pd.DataFrame(results)[["GBDT only", "linear blend (v2.0)", "level-2 stacker"]].to_string(float_format=lambda x: f"{x:.4f}"))
-    (CE_DIR / f"stack2_cv{tag}.json").write_text(json.dumps({k: float(v) for k, v in results["level-2 stacker"].items()}, indent=2))
-
-
-def apply(val_run: str, test_run: str, out_dir: str, tag: str = "") -> None:
-    from export import export_submission
-    from io_utils import read_cleaned_table
-    from predict import summarize
-
-    _stage(f"fitting the stacker on all dev_val pairs (CE scores{tag or ' round 1'})")
-    d = _val_frame(val_run, tag)
-    booster = xgb.train(PARAMS, xgb.DMatrix(_design(d), label=d["label"].to_numpy()), ROUNDS)
-    val_all = pd.read_parquet(config.MODELS_DIR / val_run / "val_predictions.parquet")
-    truth = entity_truth(load_ground_truth())
-    val_mask = split_entities(truth["country"].to_numpy()) == ROLE_VAL
-    # threshold from the CV protocol would need the OOF run; in-sample stacker scores on
-    # dev_val would overstate confidence, so reuse CV: fit on one fold, tune on the other
-    fold = (pd.util.hash_pandas_object(d["source1_entity_id"], index=False).to_numpy() % 2).astype(int)
-    oof = np.zeros(len(d))
-    for k in (0, 1):
-        b = xgb.train(PARAMS, xgb.DMatrix(_design(d[fold != k]), label=d["label"].to_numpy()[fold != k]), ROUNDS)
-        oof[fold == k] = b.predict(xgb.DMatrix(_design(d[fold == k])))
     pairs = val_all.merge(d[KEY].assign(new=oof), on=KEY, how="left")
     pairs["score"] = pairs["new"].fillna(pairs["score"])
     codes = pd.Index(truth["source1_entity_id"]).get_indexer(pairs["source1_entity_id"])
     thr = tune_threshold(codes, pairs["score"].to_numpy(), pairs["label"].to_numpy(), truth["n_true"].to_numpy(), val_mask).threshold
-    print(f"  stacker threshold (from CV): {thr:.3f}", flush=True)
+    return thr, _macro(pairs, thr, val_ent)
+
+
+def cv(val_run: str, tags: list, bag: int, coherence: bool = False) -> None:
+    _stage(f"loading dev_val pairs + features (CE {tags}, bag {bag}, coherence {coherence})")
+    d = _val_frame(val_run, tags, coherence)
+    _stage("2-fold CV by entity")
+    thr, res = _tuned(val_run, d, _oof(d, bag))
+    res["threshold"] = thr
+    print(res.to_string(float_format=lambda x: f"{x:.5f}"), flush=True)
+    (CE_DIR / f"stack2_cv{_suffix(tags, bag, coherence)}.json").write_text(json.dumps({k: float(v) for k, v in res.items()}, indent=2))
+
+
+def apply(val_run: str, test_run: str, out_dir: str, tags: list, bag: int, threshold_shift: float = 0.0,
+          coherence: bool = False) -> None:
+    from export import export_submission
+    from io_utils import read_cleaned_table
+    from predict import summarize
+
+    _stage(f"fitting the stacker on all dev_val pairs (CE {tags}, bag {bag}, coherence {coherence})")
+    d = _val_frame(val_run, tags, coherence)
+    boosters = _fit(_design(d), d["label"].to_numpy(), bag)
+    # threshold from out-of-fold scores: in-sample scores would overstate confidence
+    thr, _ = _tuned(val_run, d, _oof(d, bag))
+    thr = float(np.clip(thr + threshold_shift, 0.01, 0.99))
+    print(f"  stacker threshold (from CV, shift {threshold_shift:+.3f}): {thr:.3f}", flush=True)
 
     _stage("scoring test pairs")
-    tce = _attach_features(pd.read_parquet(CE_DIR / f"test_scores{tag}.parquet"), config.FEATURES_DIR / f"test_{UNION}")
-    tce["new"] = booster.predict(xgb.DMatrix(_design(tce)))
+    tce = _attach_features(_scores("test", tags), config.FEATURES_DIR / f"test_{UNION}")
+    if coherence:
+        tce = add_coherence(tce, "test")
+    tce["new"] = _predict(boosters, _design(tce))
     test_all = pd.read_parquet(config.PREDICTIONS_DIR / test_run / f"test_{UNION}.parquet")
     test_all = test_all.merge(tce[KEY + ["new"]], on=KEY, how="left")
     test_all["score"] = test_all["new"].fillna(test_all["score"]).astype(np.float32)
@@ -163,9 +222,13 @@ def apply(val_run: str, test_run: str, out_dir: str, tag: str = "") -> None:
     source1 = read_cleaned_table("test", "source1", columns=["entity_id", "country"]).to_pandas()
     export_submission(Path(out_dir), source1["entity_id"].to_numpy(), test_all, matches)
     print(summarize(source1, test_all, matches).to_string(float_format=lambda x: f"{x:.4f}"))
-    booster.save_model(str(CE_DIR / f"stack2_model{tag}.json"))
-    (CE_DIR / f"stack2_config{tag}.json").write_text(json.dumps({"threshold": thr, "ce_tag": tag, "rounds": ROUNDS, "params": PARAMS,
-                                                          "features": PAIR_FEATURES}, indent=2))
+    sfx = _suffix(tags, bag, coherence)
+    test_all.to_parquet(CE_DIR / f"test_stacked{sfx}.parquet", index=False)  # final pair scores (self-training, threshold probes)
+    for i, b in enumerate(boosters):
+        b.save_model(str(CE_DIR / f"stack2_model{sfx}_{i}.json"))
+    (CE_DIR / f"stack2_config{sfx}.json").write_text(json.dumps(
+        {"threshold": thr, "threshold_shift": threshold_shift, "ce_tags": tags, "bag": bag, "coherence": coherence, "rounds": ROUNDS,
+         "params": PARAMS, "features": PAIR_FEATURES}, indent=2))
     _stage("done -- validate, then upload")
 
 
@@ -175,12 +238,15 @@ def main() -> None:
     parser.add_argument("--val-run", default="dev_v11")
     parser.add_argument("--test-run", default="final_v11")
     parser.add_argument("--out-dir", default=str(config.OUTPUT_DIR))
-    parser.add_argument("--tag", default="", help="Which CE scores: '' = round 1, '_r2' = round 2.")
+    parser.add_argument("--tag", default="", help="CE score set(s): '' = round 1, '_r2', or '_r2,_r3' to stack two rounds.")
+    parser.add_argument("--bag", type=int, default=1, help="Seed-bagged stackers averaged.")
+    parser.add_argument("--threshold-shift", type=float, default=0.0, help="apply: added to the CV threshold (global, all countries).")
+    parser.add_argument("--coherence", action="store_true", help="Add sibling-coherence features (embedding cosine to the S1's top other candidate).")
     args = parser.parse_args()
     if args.cmd == "cv":
-        cv(args.val_run, args.tag)
+        cv(args.val_run, _tags(args.tag), args.bag, args.coherence)
     else:
-        apply(args.val_run, args.test_run, args.out_dir, args.tag)
+        apply(args.val_run, args.test_run, args.out_dir, _tags(args.tag), args.bag, args.threshold_shift, args.coherence)
 
 
 if __name__ == "__main__":

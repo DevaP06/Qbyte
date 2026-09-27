@@ -13,7 +13,7 @@ How to run each stage: [business_entity_resolution/README.md](business_entity_re
 | **v1.1** | `v1.1.0` | cycle 1: competition + street-core + acronym features (57 features) | **0.9857** | **0.978** |
 | **v2.0** | `v2.0` | + cross-encoder (from the retriever) on pairs with GBDT ≥ 0.02, linear blend | **0.9872** | **0.981238** |
 | v2.1 | – (built as the gate fallback) | + level-2 stacker (XGBoost over GBDT + CE scores + 14 pair features), 2-fold CV by entity | 0.9887 (CV) | – |
-| **v2.2** | `v2.2` | CE round 2 (new fit entities + France agreement pairs) → stacker; `python src/run_v22.py` | **0.9888 (CV)** | _pending_ |
+| **v2.2** | `v2.2` | CE round 2 (new fit entities + France agreement pairs) → stacker; `python src/run_v22.py` | **0.9888 (CV)** | **0.983516** |
 
 Measured and rejected (no significant gain): bipartite assignment (+0.00000), label-free
 France threshold (−0.0015 on US-as-unseen), pseudo-labeled GBDT (+0.0008), reverse retrieval
