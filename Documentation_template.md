@@ -12,10 +12,11 @@ A four-stage cascade: scalable candidate generation (country-partitioned IDF tok
 blocking ∪ exact kNN over a fine-tuned multilingual-e5-small retriever), a 57-feature
 XGBoost pair classifier, three rounds of cross-encoders plus a multilingual-e5-base
 cross-encoder on the pairs the classifier cannot settle, and a level-2 XGBoost stacker
-that learns when to trust which score. Key innovations: *competition features* (how this
+that learns when to trust which score, followed by per-entity expected-F0.5 decisions
+in place of one global threshold. Key innovations: *competition features* (how this
 S1 ranks against every other S1 claiming the same record) and cross-encoder training
 that reaches France (no labels) through unlabeled agreement pairs and synthetic
-French hard negatives. Dev macro F0.5 0.98921 (India 0.99000 / US 0.98868), portal 0.985226.
+French hard negatives. Dev macro F0.5 0.98926 (India 0.99007 / US 0.98872), portal 0.985302.
 
 ---
 
@@ -117,15 +118,23 @@ on dev CV not dropping for India and US.
 
 **Threshold selection method:** direct macro F0.5 maximization, averaged over every S1
 entity exactly as the challenge defines it: GBDT 0.72 on dev_val, stacker 0.70 on
-out-of-fold dev_val scores. Post-processing gives each S2/S3 id to at most one S1 (its
-highest-scoring one), which measured +0.0004.
+out-of-fold dev_val scores. The final decision is then made **per entity**. Macro F0.5
+scores each S1 as F = 1.25·TP / (k + 0.25·n_true), so the best cut depends on the
+entity: a lone candidate is worth predicting above p = 0.5, while a fourth candidate
+next to three near-certain matches needs p > ~0.77. For every S1 with a candidate in
+[0.2, 0.95], `expected_f.py` treats the stacker probabilities as independent Bernoullis
+and keeps the top-k candidates that maximize the exact expected F0.5 (Poisson-binomial
+expectation; verified against brute-force enumeration). Other S1s keep the 0.70 cut,
+which gives the same decision there. Measured +0.00005 on dev and +0.000076 on the
+portal. Post-processing gives each S2/S3 id to at most one S1 (its highest-scoring
+one), which measured +0.0004.
 
 ---
 
 ## 5. Results & Error Analysis
 
-- **F_0.5 Score (macro):** 0.98921 on dev_val (2-fold CV by entity; India 0.99000, US
-  0.98868). Portal 0.985226. The gap is France (~15% of test, implied F0.5 ≈ 0.955).
+- **F_0.5 Score (macro):** 0.98926 on dev_val (2-fold CV by entity; India 0.99007, US
+  0.98872). Portal 0.985302. The gap is France (~15% of test, implied F0.5 ≈ 0.955).
 - **Common false positives (wrong merges):** near-duplicate distractors (same brand,
   another branch), same address but a different business (shared buildings, one
   business word substituted), house-number conflicts on the same street, and name-only
@@ -178,7 +187,8 @@ full command sequence and `requirements.txt` with pinned versions. Entry points,
 | Retriever | `finetune_data.py`, `finetune_embeddings.py`, `embeddings.py` |
 | Union + features + GBDT | `run_union_pipeline.py` (`candidate_generation.py`, `features.py`, `competition_features.py`, `train_classifier.py`), `predict.py` |
 | Cross-encoders | `cross_encoder.py` (round 1), `run_v22.py` (round 2), `run_v23.py` (round 3), `run_v25.py` / `ce_base.py` (e5-base) |
-| Final output | `stack2.py apply --bag 5 --coherence --tag _r2,_r3 --extra-tag _base` → `output/matching_results.tsv`, `output/candidate_pairs.tsv` |
+| Final stacker | `stack2.py apply --bag 5 --coherence --tag _r2,_r3 --extra-tag _base` → `output/candidate_pairs.tsv` + final pair scores |
+| Final decisions | `expected_f.py test --out-dir ../../output` → `output/matching_results.tsv` |
 
 ### B. Additional Results
 
@@ -190,10 +200,12 @@ full command sequence and `requirements.txt` with pinned versions. Entry points,
 | v2.0 | + cross-encoder, linear blend | 0.9872 | 0.9812 |
 | v2.2 | + CE round 2 (French agreement pairs), level-2 stacker | 0.9888 | 0.9835 |
 | v2.3 | + CE round 3 (synthetic French negatives), 5-seed bagging, coherence | 0.98909 | 0.9849 |
-| **v2.5** | + multilingual-e5-base cross-encoder | **0.98921** | **0.985226** |
+| v2.5 | + multilingual-e5-base cross-encoder | 0.98921 | 0.985226 |
+| **v2.6** | + per-entity expected-F0.5 decisions | **0.98926** | **0.985302** |
 
 Measured and rejected: bipartite (1:1) assignment (+0.0000), label-free per-country
 threshold (−0.0015 simulated with US as the unseen country), pseudo-labeled GBDT
 (+0.0008), reverse retrieval (≤ +0.0002), larger retrieval k (≤ +0.0009 for 2× the
-pairs), stacker over all 57 features (+0.0001), and French normalization that strips
-legal forms (portal −0.0036).
+pairs), stacker over all 57 features (+0.0001), French normalization that strips
+legal forms (portal −0.0036), and importance-weighting the stacker's training rows toward
+the test distribution (covariate-shift correction; portal 0.985192, −0.00003).

@@ -15,7 +15,9 @@ How to run each stage: [business_entity_resolution/README.md](business_entity_re
 | v2.1 | – (built as the gate fallback) | + level-2 stacker (XGBoost over GBDT + CE scores + 14 pair features), 2-fold CV by entity | 0.9887 (CV) | – |
 | **v2.2** | `v2.2` | CE round 2 (new fit entities + France agreement pairs) → stacker; `python src/run_v22.py` | **0.9888 (CV)** | **0.983516** |
 | **v2.3** | (in `v2.5`) | CE round 3 (France agreement + synthetic + S1-S1 negatives) + stacker over CE r2+r3, 5-seed bagging, coherence; `python src/run_v23.py` | **0.98909 (CV)** | **0.984944** |
-| **v2.5 (best)** | `v2.5` | v2.3 + multilingual-e5-base cross-encoder (MIT, 278M) on uncertain pairs, as an extra stacker score (`src/ce_base.py`, `src/run_e5_remote.py`; stacker: `python src/stack2.py apply --bag 5 --coherence --tag _r2,_r3 --extra-tag _base`) | **0.98921 (CV)** | **0.985226** |
+| **v2.5** | `v2.5` | v2.3 + multilingual-e5-base cross-encoder (MIT, 278M) on uncertain pairs, as an extra stacker score (`src/ce_base.py`, `src/run_e5_remote.py`; stacker: `python src/stack2.py apply --bag 5 --coherence --tag _r2,_r3 --extra-tag _base`) | **0.98921 (CV)** | **0.985226** |
+| **v2.6 (best, final)** | – | v2.5 + per-entity expected-F0.5 decisions instead of one global threshold (`python src/expected_f.py test --out-dir ../../output` after the v2.5 stacker) | **0.98926 (CV)** | **0.985302** |
+| v2.5b (rejected) | – | importance-weighted stacker (dev rows weighted toward the test distribution) | – | 0.985192 |
 | v2.4 (rejected) | – | + French normalization of GBDT features (legal forms stripped, street types expanded, accents folded) | 0.98919 (CV) | 0.98164 ↓ |
 
 Measured and rejected (no significant gain): bipartite assignment (+0.00000), label-free

@@ -1,13 +1,14 @@
 # Business Entity Resolution
 
 Matches every Source 1 business to its records in Source 2 / Source 3.
-Final version **v2.5**: dev_val macro F0.5 0.98921 (2-fold CV, India 0.99000 /
-US 0.98868), portal 0.985226.
+Final version **v2.6**: dev_val macro F0.5 0.98926 (2-fold CV, India 0.99007 /
+US 0.98872), portal 0.985302.
 
 Pipeline: cleaning → token blocking ∪ fine-tuned embedding retrieval →
 57 pair features → XGBoost → three cross-encoder rounds (multilingual-e5-small)
 + a multilingual-e5-base cross-encoder on uncertain pairs → level-2 XGBoost
-stacker → threshold + one-S1-per-record post-processing → export.
+stacker → per-entity expected-F0.5 decisions + one-S1-per-record
+post-processing → export.
 Methodology and measurements: `Documentation_template.md` at the zip root.
 
 ## Layout
@@ -87,8 +88,12 @@ python run_v23.py
 #    many training pairs are used (benchmarked on the GPU; we used 110 min on an RTX 4000 Ada)
 python run_v25.py --budget-min 110
 
-# 9. Final submission (run_v25.py ends with exactly this when its gate passes)
+# 9. Final stacker (run_v25.py ends with exactly this when its gate passes): writes
+#    output/ (both files) and the final pair scores test_stacked_r2_r3_bag5_coh_base.parquet
 python stack2.py apply --bag 5 --coherence --tag _r2,_r3 --extra-tag _base
+# 10. Per-entity expected-F0.5 decisions from those scores (v2.6): rewrites
+#     output/matching_results.tsv; `python expected_f.py dev` measures it on dev_val
+python expected_f.py test --out-dir ../../output
 cd ../.. && python utils/validate_submission.py --matching output/matching_results.tsv \
     --candidate output/candidate_pairs.tsv --test-dir data/raw/test --check-ids
 ```
