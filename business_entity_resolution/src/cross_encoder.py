@@ -53,6 +53,58 @@ def _pairs_for(features_dir: Path, s1_ids: set, columns: list) -> pd.DataFrame:
     return pd.concat(out, ignore_index=True)
 
 
+def _labelled_pairs(s1_ids: set, gt: pd.DataFrame, negatives_per_entity: int, seed: int) -> pd.DataFrame:
+    """All true pairs + the hardest negatives (highest emb_cos + name similarity)
+    of the given train S1 entities, with both records' texts."""
+    _stage(f"selecting pairs for {len(s1_ids):,} train entities")
+    f = _pairs_for(config.FEATURES_DIR / f"train_{UNION}", s1_ids,
+                   ["source1_entity_id", "candidate_entity_id", "emb_cos", "name_token_set_ratio"])
+    f["label"] = PairLabeler(ground_truth_pairs(gt)).label(f["source1_entity_id"].to_numpy(), f["candidate_entity_id"].to_numpy())
+    f["hardness"] = f["emb_cos"].fillna(0) + f["name_token_set_ratio"].fillna(0)
+    neg = f[f["label"] == 0].sort_values("hardness", ascending=False).groupby("source1_entity_id").head(negatives_per_entity)
+    pairs = pd.concat([f[f["label"] == 1], neg])
+    _stage("attaching record texts")
+    texts = record_texts("train")
+    return pairs.assign(
+        text_a=texts.reindex(pairs["source1_entity_id"]).to_numpy(),
+        text_b=texts.reindex(pairs["candidate_entity_id"]).to_numpy(),
+    )[["source1_entity_id", "candidate_entity_id", "text_a", "text_b", "label"]].sample(frac=1.0, random_state=seed)
+
+
+def export_round2(n_entities: int, france_per_class: int, negatives_per_entity: int, seed: int) -> None:
+    """Round-2 training data: labelled pairs of fit entities round 1 never saw,
+    plus France agreement pairs -- test pairs where the GBDT and the round-1 CE
+    agree strongly (both >= 0.98: match; CE <= 0.02 with GBDT < 0.5: non-match).
+    Those are the most reliable labels available for France (two different
+    models, text vs engineered features, agreeing) and teach the CE French
+    street/name patterns. dev_val entities are never included."""
+    rng = np.random.default_rng(seed + 1)
+    gt = load_ground_truth()
+    truth = entity_truth(gt)
+    roles = split_entities(truth["country"].to_numpy())
+    used = set(pd.read_parquet(CE_DIR / "train.parquet", columns=["source1_entity_id"])["source1_entity_id"])
+    fresh = np.array([i for i in truth["source1_entity_id"].to_numpy()[roles == ROLE_FIT] if i not in used])
+    pairs = _labelled_pairs(set(rng.choice(fresh, size=min(n_entities, len(fresh)), replace=False)), gt, negatives_per_entity, seed)
+
+    _stage("France agreement pairs from test")
+    ts = pd.read_parquet(CE_DIR / "test_scores.parquet")
+    fr = ts[ts["country"] == "France"]
+    pos = fr[(fr["score"] >= 0.98) & (fr["ce"] >= 0.98)]
+    neg = fr[(fr["ce"] <= 0.02) & (fr["score"] < 0.5)]
+    pos = pos.sample(min(france_per_class, len(pos)), random_state=seed).assign(label=1)
+    neg = neg.sample(min(france_per_class, len(neg)), random_state=seed).assign(label=0)
+    texts = record_texts("test")
+    france = pd.concat([pos, neg])
+    france = france.assign(
+        text_a=texts.reindex(france["source1_entity_id"]).to_numpy(),
+        text_b=texts.reindex(france["candidate_entity_id"]).to_numpy(),
+    )[["source1_entity_id", "candidate_entity_id", "text_a", "text_b", "label"]]
+    out = pd.concat([pairs, france]).sample(frac=1.0, random_state=seed)
+    out.to_parquet(CE_DIR / "train_r2.parquet", index=False)
+    print(f"  round-2 train: {len(pairs):,} labelled pairs from {min(n_entities, len(fresh)):,} new fit entities "
+          f"+ {len(france):,} France agreement pairs ({len(pos):,} match / {len(neg):,} non-match) -> train_r2.parquet", flush=True)
+
+
 def export(n_entities: int, negatives_per_entity: int, seed: int) -> None:
     """Positives + the most confusable negatives (highest emb_cos / name
     similarity) of sampled fit entities; eval pairs from early-stop entities."""
@@ -64,20 +116,7 @@ def export(n_entities: int, negatives_per_entity: int, seed: int) -> None:
     fit_ids = set(rng.choice(ids[roles == ROLE_FIT], size=n_entities, replace=False))
     es_ids = set(rng.choice(ids[roles == ROLE_EARLY_STOP], size=min(20_000, (roles == ROLE_EARLY_STOP).sum()), replace=False))
 
-    _stage(f"selecting pairs for {len(fit_ids):,} fit + {len(es_ids):,} eval entities")
-    f = _pairs_for(config.FEATURES_DIR / f"train_{UNION}", fit_ids | es_ids,
-                   ["source1_entity_id", "candidate_entity_id", "emb_cos", "name_token_set_ratio"])
-    f["label"] = PairLabeler(ground_truth_pairs(gt)).label(f["source1_entity_id"].to_numpy(), f["candidate_entity_id"].to_numpy())
-    f["hardness"] = f["emb_cos"].fillna(0) + f["name_token_set_ratio"].fillna(0)
-    neg = f[f["label"] == 0].sort_values("hardness", ascending=False).groupby("source1_entity_id").head(negatives_per_entity)
-    pairs = pd.concat([f[f["label"] == 1], neg])
-
-    _stage("attaching record texts")
-    texts = record_texts("train")
-    pairs = pairs.assign(
-        text_a=texts.reindex(pairs["source1_entity_id"]).to_numpy(),
-        text_b=texts.reindex(pairs["candidate_entity_id"]).to_numpy(),
-    )[["source1_entity_id", "candidate_entity_id", "text_a", "text_b", "label"]].sample(frac=1.0, random_state=seed)
+    pairs = _labelled_pairs(fit_ids | es_ids, gt, negatives_per_entity, seed)
     CE_DIR.mkdir(parents=True, exist_ok=True)
     is_eval = pairs["source1_entity_id"].isin(es_ids)
     pairs[~is_eval].to_parquet(CE_DIR / "train.parquet", index=False)
@@ -86,7 +125,8 @@ def export(n_entities: int, negatives_per_entity: int, seed: int) -> None:
           f"eval {int(is_eval.sum()):,} -> {CE_DIR}", flush=True)
 
 
-def train(base_model: str, epochs: float, batch_size: int, lr: float, max_length: int, max_rows: int) -> None:
+def train(base_model: str, epochs: float, batch_size: int, lr: float, max_length: int, max_rows: int,
+          train_file: str = "train.parquet", out_dir: Path = CE_MODEL_DIR) -> None:
     import torch
     from sentence_transformers import InputExample
     from sentence_transformers.cross_encoder import CrossEncoder
@@ -94,7 +134,7 @@ def train(base_model: str, epochs: float, batch_size: int, lr: float, max_length
     from torch.utils.data import DataLoader
 
     print(f"device: {'cuda: ' + torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'}", flush=True)
-    tr = pd.read_parquet(CE_DIR / "train.parquet")
+    tr = pd.read_parquet(CE_DIR / train_file)
     ev = pd.read_parquet(CE_DIR / "eval.parquet")
     ev = ev.sample(min(len(ev), 30_000), random_state=0)  # each periodic eval re-scores this set
     if max_rows:
@@ -107,7 +147,7 @@ def train(base_model: str, epochs: float, batch_size: int, lr: float, max_length
     steps = int(len(loader) * epochs)
     print(f"[2/3] training {steps:,} steps (progress bar below; eval every {max(steps // 5, 1):,} steps)", flush=True)
     t0 = time.time()
-    CE_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     model.fit(
         train_dataloader=loader, evaluator=evaluator, epochs=max(1, round(epochs)), warmup_steps=int(0.1 * steps),
         optimizer_params={"lr": lr}, evaluation_steps=max(steps // 5, 1), use_amp=torch.cuda.is_available(),
@@ -115,11 +155,11 @@ def train(base_model: str, epochs: float, batch_size: int, lr: float, max_length
     )
     print("[3/3] final evaluation ...", flush=True)
     score = evaluator(model)
-    model.save(str(CE_MODEL_DIR))
-    (CE_MODEL_DIR / "ce_config.json").write_text(json.dumps(
-        {"base_model": base_model, "train_rows": len(tr), "epochs": epochs, "batch_size": batch_size, "lr": lr,
-         "max_length": max_length, "eval_average_precision": score, "minutes": (time.time() - t0) / 60}, indent=2))
-    print(f"eval average precision {score:.4f}; saved to {CE_MODEL_DIR} ({(time.time() - t0) / 60:.1f} min)", flush=True)
+    model.save(str(out_dir))
+    (out_dir / "ce_config.json").write_text(json.dumps(
+        {"base_model": base_model, "train_file": train_file, "train_rows": len(tr), "epochs": epochs, "batch_size": batch_size,
+         "lr": lr, "max_length": max_length, "eval_average_precision": score, "minutes": (time.time() - t0) / 60}, indent=2))
+    print(f"eval average precision {score:.4f}; saved to {out_dir} ({(time.time() - t0) / 60:.1f} min)", flush=True)
 
 
 def _score_file(model, split: str, src: Path, dest: Path, lo: float, batch_size: int, limit: int) -> None:
@@ -137,20 +177,22 @@ def _score_file(model, split: str, src: Path, dest: Path, lo: float, batch_size:
     sel.to_parquet(dest, index=False)
 
 
-def score(val_run: str, test_run: str, lo: float, batch_size: int, limit: int) -> None:
+def score(val_run: str, test_run: str, lo: float, batch_size: int, limit: int,
+          model_dir: Path = CE_MODEL_DIR, tag: str = "") -> None:
     """CE probability for every pair the GBDT gives >= lo: dev_val pairs (to
     tune the blend) and test pairs (to apply it). Confident accepts are
-    included on purpose -- France's worst errors score 0.98+."""
+    included on purpose -- France's worst errors score 0.98+. Writes
+    val_scores{tag}.parquet / test_scores{tag}.parquet."""
     import torch
     from sentence_transformers.cross_encoder import CrossEncoder
 
-    model = CrossEncoder(str(CE_MODEL_DIR), max_length=128)
+    model = CrossEncoder(str(model_dir), max_length=128)
     if torch.cuda.is_available():
         model.model.half()
-    _stage("scoring dev_val pairs")
-    _score_file(model, "train", config.MODELS_DIR / val_run / "val_predictions.parquet", CE_DIR / "val_scores.parquet", lo, batch_size, limit)
-    _stage("scoring test pairs")
-    _score_file(model, "test", config.PREDICTIONS_DIR / test_run / f"test_{UNION}.parquet", CE_DIR / "test_scores.parquet", lo, batch_size, limit)
+    _stage(f"scoring dev_val pairs with {model_dir.name}")
+    _score_file(model, "train", config.MODELS_DIR / val_run / "val_predictions.parquet", CE_DIR / f"val_scores{tag}.parquet", lo, batch_size, limit)
+    _stage(f"scoring test pairs with {model_dir.name}")
+    _score_file(model, "test", config.PREDICTIONS_DIR / test_run / f"test_{UNION}.parquet", CE_DIR / f"test_scores{tag}.parquet", lo, batch_size, limit)
 
 
 def _logit(p: np.ndarray) -> np.ndarray:
@@ -227,8 +269,12 @@ def main() -> None:
     e.add_argument("--entities", type=int, default=400_000, help="Fit entities sampled for training pairs.")
     e.add_argument("--negatives", type=int, default=4, help="Hardest negatives kept per entity.")
     e.add_argument("--seed", type=int, default=config.SPLIT_SEED)
+    e.add_argument("--round2", action="store_true", help="New fit entities + France agreement pairs -> train_r2.parquet.")
+    e.add_argument("--france-per-class", type=int, default=200_000)
     t = sub.add_parser("train")
     t.add_argument("--base-model", default=str(config.MODELS_DIR / "retriever"))
+    t.add_argument("--train-file", default="train.parquet")
+    t.add_argument("--out-model", default=str(CE_MODEL_DIR))
     t.add_argument("--epochs", type=float, default=1.0)
     t.add_argument("--batch-size", type=int, default=128)
     t.add_argument("--lr", type=float, default=2e-5)
@@ -240,17 +286,23 @@ def main() -> None:
     s.add_argument("--lo", type=float, default=0.02, help="Re-score pairs with GBDT score >= this.")
     s.add_argument("--batch-size", type=int, default=512)
     s.add_argument("--limit", type=int, default=0, help="Score only the first N pairs per split (smoke test).")
+    s.add_argument("--model", default=str(CE_MODEL_DIR))
+    s.add_argument("--tag", default="", help="Output suffix: val_scores{tag}.parquet / test_scores{tag}.parquet.")
     b = sub.add_parser("blend")
     b.add_argument("--val-run", default="dev_v11")
     b.add_argument("--test-run", default="final_v11")
     b.add_argument("--out-dir", default=str(config.OUTPUT_DIR))
     args = parser.parse_args()
     if args.cmd == "export":
-        export(args.entities, args.negatives, args.seed)
+        if args.round2:
+            export_round2(args.entities, args.france_per_class, args.negatives, args.seed)
+        else:
+            export(args.entities, args.negatives, args.seed)
     elif args.cmd == "train":
-        train(args.base_model, args.epochs, args.batch_size, args.lr, args.max_length, args.max_rows)
+        train(args.base_model, args.epochs, args.batch_size, args.lr, args.max_length, args.max_rows,
+              train_file=args.train_file, out_dir=Path(args.out_model))
     elif args.cmd == "score":
-        score(args.val_run, args.test_run, args.lo, args.batch_size, args.limit)
+        score(args.val_run, args.test_run, args.lo, args.batch_size, args.limit, model_dir=Path(args.model), tag=args.tag)
     else:
         blend(args.val_run, args.test_run, args.out_dir)
 

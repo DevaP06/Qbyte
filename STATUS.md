@@ -1,6 +1,6 @@
 # Status & where to pick up next
 
-_Last updated: 2026-09-26 (competition deadline ≈ 27 h away). Read this first when resuming._
+_Last updated: 2026-09-27 07:50. Read this first when resuming._
 Plan: [plan.md](plan.md) · Rules: [PROBLEM_STATEMENT.md](PROBLEM_STATEMENT.md) ·
 How to run each stage: [business_entity_resolution/README.md](business_entity_resolution/README.md)
 
@@ -11,7 +11,13 @@ How to run each stage: [business_entity_resolution/README.md](business_entity_re
 | v0.1.0 | – (commit `150a178`) | token blocking + 43 features + XGBoost | 0.9469 | 0.9378 |
 | **v1.0.0** | `v1.0.0` | + fine-tuned e5 embedding retrieval (k=20) + 5 embedding features | **0.9799** | **0.9724** |
 | **v1.1** | `v1.1.0` | cycle 1: competition + street-core + acronym features (57 features) | **0.9857** | **0.978** |
-| v1.2+ | – | cycle 2: France adaptation, stacking, cross-encoder | _in progress_ | |
+| **v2.0** | `v2.0` | + cross-encoder (from the retriever) on pairs with GBDT ≥ 0.02, linear blend | **0.9872** | **0.981238** |
+| v2.1 | – (built as the gate fallback) | + level-2 stacker (XGBoost over GBDT + CE scores + 14 pair features), 2-fold CV by entity | 0.9887 (CV) | – |
+| **v2.2** | `v2.2` | CE round 2 (new fit entities + France agreement pairs) → stacker; `python src/run_v22.py` | **0.9888 (CV)** | _pending_ |
+
+Measured and rejected (no significant gain): bipartite assignment (+0.00000), label-free
+France threshold (−0.0015 on US-as-unseen), pseudo-labeled GBDT (+0.0008), reverse retrieval
+(≤ +0.0002), larger retrieval K (≤ +0.0009 total), stacker with all 57 features (+0.0001).
 
 Leaderboard (≈24 h left): top 3 = 0.990, top 50 ≥ 0.988. **Goal: top 10 (≈ 0.990+).**
 That needs France ≈ 0.985: v1.1 implies France ≈ 0.927 vs India 0.9865 / US 0.9852,

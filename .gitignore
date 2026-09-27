@@ -43,6 +43,8 @@ aws.json
 data/processed/models/
 # Record embeddings from embeddings.py (~9GB per split)
 data/processed/embeddings/
+# Cross-encoder / stacker run outputs (scores, CV results, stacker models) -- regenerable
+data/processed/cross_encoder/
 
 # MLflow
 mlruns/
