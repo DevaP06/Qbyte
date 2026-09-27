@@ -111,6 +111,10 @@ def _design(d: pd.DataFrame) -> np.ndarray:
         cols += ["lc2", "ce_rounds_diff"]
     if "coh_cos" in d.columns:
         cols += ["coh_cos", "coh_other_source"]
+    if "ce_x" in d.columns:  # partially scored extra CE (e5-base): NaN outside its band
+        d["lx"] = _logit(d["ce_x"].to_numpy())
+        d["x_vs_ce"] = d["lx"] - d["lc"]
+        cols += ["lx", "x_vs_ce"]
     return d[cols].to_numpy(np.float32)
 
 
@@ -120,20 +124,36 @@ def _tags(spec: str) -> list:
     return spec.split(",")
 
 
-def _suffix(tags: list, bag: int, coherence: bool = False) -> str:
-    return "".join(tags) + (f"_bag{bag}" if bag > 1 else "") + ("_coh" if coherence else "")
+def _suffix(tags: list, bag: int, coherence: bool = False, extra: str = "", val_run: str = "dev_v11") -> str:
+    return ("".join(tags) + (f"_bag{bag}" if bag > 1 else "") + ("_coh" if coherence else "") + extra
+            + ("" if val_run == "dev_v11" else f"_{val_run}"))
 
 
-def _scores(kind: str, tags: list) -> pd.DataFrame:
+def _gbdt_scores(kind: str, run: str) -> pd.DataFrame:
+    """GBDT score per pair from a train_classifier run: dev_val predictions of a
+    dev run, or cached test predictions of a final run."""
+    path = config.MODELS_DIR / run / "val_predictions.parquet" if kind == "val" else config.PREDICTIONS_DIR / run / f"test_{UNION}.parquet"
+    return pd.read_parquet(path, columns=KEY + ["score"])
+
+
+def _scores(kind: str, tags: list, extra: str = "", gbdt_run: str = "") -> pd.DataFrame:
     base = pd.read_parquet(CE_DIR / f"{kind}_scores{tags[-1]}.parquet")
+    if gbdt_run:  # replace the GBDT score frozen in the CE file by this run's
+        new = _gbdt_scores(kind, gbdt_run).rename(columns={"score": "gbdt_new"})
+        base = base.merge(new, on=KEY, how="left")
+        base["score"] = base["gbdt_new"].fillna(base["score"])
+        base = base.drop(columns="gbdt_new")
+    if extra:
+        x = pd.read_parquet(CE_DIR / f"{kind}_scores{extra}.parquet", columns=KEY + ["ce"]).rename(columns={"ce": "ce_x"})
+        base = base.merge(x, on=KEY, how="left")
     if len(tags) > 1:
         other = pd.read_parquet(CE_DIR / f"{kind}_scores{tags[0]}.parquet", columns=KEY + ["ce"]).rename(columns={"ce": "ce2"})
         base = base.merge(other, on=KEY, how="left")
     return base
 
 
-def _val_frame(val_run: str, tags: list, coherence: bool = False) -> pd.DataFrame:
-    d = _attach_features(_scores("val", tags), config.FEATURES_DIR / f"train_{UNION}")
+def _val_frame(val_run: str, tags: list, coherence: bool = False, extra: str = "") -> pd.DataFrame:
+    d = _attach_features(_scores("val", tags, extra, val_run), config.FEATURES_DIR / f"train_{UNION}")
     return add_coherence(d, "train") if coherence else d
 
 
@@ -183,24 +203,24 @@ def _tuned(val_run: str, d: pd.DataFrame, oof: np.ndarray):
     return thr, _macro(pairs, thr, val_ent)
 
 
-def cv(val_run: str, tags: list, bag: int, coherence: bool = False) -> None:
-    _stage(f"loading dev_val pairs + features (CE {tags}, bag {bag}, coherence {coherence})")
-    d = _val_frame(val_run, tags, coherence)
+def cv(val_run: str, tags: list, bag: int, coherence: bool = False, extra: str = "") -> None:
+    _stage(f"loading dev_val pairs + features (CE {tags}, bag {bag}, coherence {coherence}, extra {extra or '-'})")
+    d = _val_frame(val_run, tags, coherence, extra)
     _stage("2-fold CV by entity")
     thr, res = _tuned(val_run, d, _oof(d, bag))
     res["threshold"] = thr
     print(res.to_string(float_format=lambda x: f"{x:.5f}"), flush=True)
-    (CE_DIR / f"stack2_cv{_suffix(tags, bag, coherence)}.json").write_text(json.dumps({k: float(v) for k, v in res.items()}, indent=2))
+    (CE_DIR / f"stack2_cv{_suffix(tags, bag, coherence, extra, val_run)}.json").write_text(json.dumps({k: float(v) for k, v in res.items()}, indent=2))
 
 
 def apply(val_run: str, test_run: str, out_dir: str, tags: list, bag: int, threshold_shift: float = 0.0,
-          coherence: bool = False) -> None:
+          coherence: bool = False, extra: str = "") -> None:
     from export import export_submission
     from io_utils import read_cleaned_table
     from predict import summarize
 
     _stage(f"fitting the stacker on all dev_val pairs (CE {tags}, bag {bag}, coherence {coherence})")
-    d = _val_frame(val_run, tags, coherence)
+    d = _val_frame(val_run, tags, coherence, extra)
     boosters = _fit(_design(d), d["label"].to_numpy(), bag)
     # threshold from out-of-fold scores: in-sample scores would overstate confidence
     thr, _ = _tuned(val_run, d, _oof(d, bag))
@@ -208,7 +228,7 @@ def apply(val_run: str, test_run: str, out_dir: str, tags: list, bag: int, thres
     print(f"  stacker threshold (from CV, shift {threshold_shift:+.3f}): {thr:.3f}", flush=True)
 
     _stage("scoring test pairs")
-    tce = _attach_features(_scores("test", tags), config.FEATURES_DIR / f"test_{UNION}")
+    tce = _attach_features(_scores("test", tags, extra, test_run), config.FEATURES_DIR / f"test_{UNION}")
     if coherence:
         tce = add_coherence(tce, "test")
     tce["new"] = _predict(boosters, _design(tce))
@@ -222,12 +242,12 @@ def apply(val_run: str, test_run: str, out_dir: str, tags: list, bag: int, thres
     source1 = read_cleaned_table("test", "source1", columns=["entity_id", "country"]).to_pandas()
     export_submission(Path(out_dir), source1["entity_id"].to_numpy(), test_all, matches)
     print(summarize(source1, test_all, matches).to_string(float_format=lambda x: f"{x:.4f}"))
-    sfx = _suffix(tags, bag, coherence)
+    sfx = _suffix(tags, bag, coherence, extra, val_run)
     test_all.to_parquet(CE_DIR / f"test_stacked{sfx}.parquet", index=False)  # final pair scores (self-training, threshold probes)
     for i, b in enumerate(boosters):
         b.save_model(str(CE_DIR / f"stack2_model{sfx}_{i}.json"))
     (CE_DIR / f"stack2_config{sfx}.json").write_text(json.dumps(
-        {"threshold": thr, "threshold_shift": threshold_shift, "ce_tags": tags, "bag": bag, "coherence": coherence, "rounds": ROUNDS,
+        {"threshold": thr, "threshold_shift": threshold_shift, "ce_tags": tags, "bag": bag, "coherence": coherence, "extra_tag": extra, "val_run": val_run, "test_run": test_run, "rounds": ROUNDS,
          "params": PARAMS, "features": PAIR_FEATURES}, indent=2))
     _stage("done -- validate, then upload")
 
@@ -241,12 +261,13 @@ def main() -> None:
     parser.add_argument("--tag", default="", help="CE score set(s): '' = round 1, '_r2', or '_r2,_r3' to stack two rounds.")
     parser.add_argument("--bag", type=int, default=1, help="Seed-bagged stackers averaged.")
     parser.add_argument("--threshold-shift", type=float, default=0.0, help="apply: added to the CV threshold (global, all countries).")
+    parser.add_argument("--extra-tag", default="", help="Partially scored extra CE (e.g. '_base'), NaN where unscored.")
     parser.add_argument("--coherence", action="store_true", help="Add sibling-coherence features (embedding cosine to the S1's top other candidate).")
     args = parser.parse_args()
     if args.cmd == "cv":
-        cv(args.val_run, _tags(args.tag), args.bag, args.coherence)
+        cv(args.val_run, _tags(args.tag), args.bag, args.coherence, args.extra_tag)
     else:
-        apply(args.val_run, args.test_run, args.out_dir, _tags(args.tag), args.bag, args.threshold_shift, args.coherence)
+        apply(args.val_run, args.test_run, args.out_dir, _tags(args.tag), args.bag, args.threshold_shift, args.coherence, args.extra_tag)
 
 
 if __name__ == "__main__":

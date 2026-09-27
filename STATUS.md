@@ -14,10 +14,15 @@ How to run each stage: [business_entity_resolution/README.md](business_entity_re
 | **v2.0** | `v2.0` | + cross-encoder (from the retriever) on pairs with GBDT ≥ 0.02, linear blend | **0.9872** | **0.981238** |
 | v2.1 | – (built as the gate fallback) | + level-2 stacker (XGBoost over GBDT + CE scores + 14 pair features), 2-fold CV by entity | 0.9887 (CV) | – |
 | **v2.2** | `v2.2` | CE round 2 (new fit entities + France agreement pairs) → stacker; `python src/run_v22.py` | **0.9888 (CV)** | **0.983516** |
+| **v2.3** | (in `v2.5`) | CE round 3 (France agreement + synthetic + S1-S1 negatives) + stacker over CE r2+r3, 5-seed bagging, coherence; `python src/run_v23.py` | **0.98909 (CV)** | **0.984944** |
+| **v2.5 (best)** | `v2.5` | v2.3 + multilingual-e5-base cross-encoder (MIT, 278M) on uncertain pairs, as an extra stacker score (`src/ce_base.py`, `src/run_e5_remote.py`; stacker: `python src/stack2.py apply --bag 5 --coherence --tag _r2,_r3 --extra-tag _base`) | **0.98921 (CV)** | **0.985226** |
+| v2.4 (rejected) | – | + French normalization of GBDT features (legal forms stripped, street types expanded, accents folded) | 0.98919 (CV) | 0.98164 ↓ |
 
 Measured and rejected (no significant gain): bipartite assignment (+0.00000), label-free
 France threshold (−0.0015 on US-as-unseen), pseudo-labeled GBDT (+0.0008), reverse retrieval
 (≤ +0.0002), larger retrieval K (≤ +0.0009 total), stacker with all 57 features (+0.0001).
+
+**v2.4 lesson:** stripping French legal forms made France worse (implied France F0.5 ≈ 0.955 → 0.931). The legal form is part of a French business's identity in this data: stripping it raises the share of distinct French S1 businesses with an identical name in the same city from 17.6% to 24.5% (`3eme amicale sarl` vs `3eme amicale eurl` are different businesses). The v2.4 code was removed; a retry would have to canonicalize legal forms (`s.a.s.` → `sas`), never delete them.
 
 Leaderboard (≈24 h left): top 3 = 0.990, top 50 ≥ 0.988. **Goal: top 10 (≈ 0.990+).**
 That needs France ≈ 0.985: v1.1 implies France ≈ 0.927 vs India 0.9865 / US 0.9852,
